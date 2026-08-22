@@ -17,16 +17,22 @@ WEBHOOK_SECRET = hashlib.sha256(
     BOT_TOKEN.encode()
 ).hexdigest() if BOT_TOKEN else ""
 
+
 def send_message(chat_id, text):
     requests.post(
         f"{TG_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text},
+        json={
+            "chat_id": chat_id,
+            "text": text
+        },
         timeout=15
     )
+
 
 @app.route("/")
 def home():
     return "Asmar Robert Bot is running ✅"
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -39,6 +45,7 @@ def webhook():
         return jsonify({"ok": False}), 403
 
     update = request.get_json(silent=True) or {}
+
     message = update.get("message", {})
     chat_id = (message.get("chat") or {}).get("id")
     text = message.get("text", "")
@@ -47,14 +54,86 @@ def webhook():
         return jsonify({"ok": True})
 
     if text == "/start":
+
         send_message(
             chat_id,
-            "أهلاً بك في Asmar Robert 🤖\n\nالبوت شغّال بنجاح ✅"
+            "أهلاً بك في Asmar Robert 🤖\n\n"
+            "البوت شغّال بنجاح ✅"
         )
 
     elif text == "/myid":
-        send_message(chat_id, f"Your Telegram ID: {chat_id}")
 
+        send_message(
+            chat_id,
+            f"Your Telegram ID: {chat_id}"
+        )
+
+    # اختبار وهمي لمعرفة هل Render يصل إلى iChancy
+    elif text == "/ichancydummy":
+
+        if chat_id != ADMIN_ID:
+            send_message(chat_id, "⛔ غير مصرح")
+            return jsonify({"ok": True})
+
+        try:
+            r = requests.post(
+                "https://agents.ichancy.com/global/api/UserApi/signin",
+                json={
+                    "username": "definitely-not-real@example.invalid",
+                    "password": "dummy-password-123456"
+                },
+                timeout=20
+            )
+
+            body = r.text.lower()
+            headers_text = str(r.headers).lower()
+
+            server = r.headers.get("server", "")
+            content_type = r.headers.get("content-type", "")
+
+            if "invalid username or password" in body:
+
+                send_message(
+                    chat_id,
+                    "✅ Render وصل إلى Agent API\n\n"
+                    f"HTTP {r.status_code}\n"
+                    "رد API: Invalid username or password"
+                )
+
+            elif (
+                r.status_code == 403
+                and (
+                    "cloudflare" in body
+                    or "cf-ray" in headers_text
+                    or "text/html" in content_type.lower()
+                )
+            ):
+
+                send_message(
+                    chat_id,
+                    "⛔ الحظر من Cloudflare / الشبكة\n\n"
+                    "HTTP 403\n"
+                    f"Server: {server}"
+                )
+
+            else:
+
+                send_message(
+                    chat_id,
+                    "⚠️ رد غير محسوم\n\n"
+                    f"HTTP {r.status_code}\n"
+                    f"Content-Type: {content_type}\n"
+                    f"Server: {server}"
+                )
+
+        except Exception:
+
+            send_message(
+                chat_id,
+                "❌ تعذر الوصول إلى iChancy من Render"
+            )
+
+    # اختبار تسجيل الدخول الحقيقي
     elif text == "/ichancytest":
 
         if chat_id != ADMIN_ID:
@@ -62,7 +141,12 @@ def webhook():
             return jsonify({"ok": True})
 
         if not ICHANCY_USERNAME or not ICHANCY_PASSWORD:
-            send_message(chat_id, "❌ بيانات iChancy غير موجودة على السيرفر")
+
+            send_message(
+                chat_id,
+                "❌ بيانات iChancy غير موجودة على السيرفر"
+            )
+
             return jsonify({"ok": True})
 
         try:
@@ -76,13 +160,20 @@ def webhook():
             )
 
             if r.status_code == 403:
+
                 send_message(
                     chat_id,
-                    "❌ iChancy رفض اتصال السيرفر\nHTTP 403"
+                    "❌ iChancy رفض اتصال السيرفر\n"
+                    "HTTP 403"
                 )
 
             else:
-                data = r.json()
+
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {}
+
                 result = data.get("result")
 
                 if (
@@ -90,31 +181,44 @@ def webhook():
                     and result.get("accessToken")
                     and result.get("refreshToken")
                 ):
+
                     send_message(
                         chat_id,
-                        "✅ تم تسجيل الدخول إلى iChancy من السيرفر بنجاح"
-                    )
-                else:
-                    send_message(
-                        chat_id,
-                        f"❌ تسجيل الدخول لم ينجح\nHTTP {r.status_code}"
+                        "✅ تم تسجيل الدخول إلى iChancy "
+                        "من السيرفر بنجاح"
                     )
 
-        except Exception as e:
+                else:
+
+                    send_message(
+                        chat_id,
+                        "❌ تسجيل الدخول لم ينجح\n"
+                        f"HTTP {r.status_code}"
+                    )
+
+        except Exception:
+
             send_message(
                 chat_id,
                 "❌ تعذر الاتصال بـ iChancy من السيرفر"
             )
 
     else:
-        send_message(chat_id, "وصلتني رسالتك ✅")
+
+        send_message(
+            chat_id,
+            "وصلتني رسالتك ✅"
+        )
 
     return jsonify({"ok": True})
+
 
 @app.route("/set-webhook")
 def set_webhook():
 
-    webhook_url = "https://asmar-robert-bot.onrender.com/webhook"
+    webhook_url = (
+        "https://asmar-robert-bot.onrender.com/webhook"
+    )
 
     response = requests.post(
         f"{TG_API}/setWebhook",
