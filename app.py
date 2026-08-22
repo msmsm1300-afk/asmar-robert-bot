@@ -10,10 +10,7 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 def send_message(chat_id, text):
     requests.post(
         f"{TG_API}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text
-        },
+        json={"chat_id": chat_id, "text": text},
         timeout=10
     )
 
@@ -36,6 +33,8 @@ def webhook():
                 chat_id,
                 "أهلاً بك في Asmar Robert 🤖\n\nالبوت شغّال بنجاح ✅"
             )
+        elif text == "/myid":
+            send_message(chat_id, f"Your Telegram ID: {chat_id}")
         else:
             send_message(chat_id, "وصلتني رسالتك ✅")
 
