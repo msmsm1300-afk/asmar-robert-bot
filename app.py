@@ -180,7 +180,7 @@ def show_home(chat_id):
     return res
 
 
-def show_account(chat_id):
+def show_account(chat_id, created=False):
     u = get_user(chat_id)
     flows.pop(chat_id, None)
     if not u["ichancy_username"]:
@@ -197,8 +197,9 @@ def show_account(chat_id):
     pwd = u["ichancy_password"] or ""
     shown = html.escape(pwd) if u.get("password_visible") else "••••••••"
     username = html.escape(u["ichancy_username"])
+    title = "✅ <b>تم إنشاء حسابك بنجاح</b>" if created else "🔐 <b>بيانات تسجيل الدخول للحساب</b>"
     text = (
-        "🔐 <b>بيانات تسجيل الدخول للحساب</b>\n\n"
+        f"{title}\n\n"
         f"👤 اسم المستخدم: <code>{username}</code>\n"
         f"🔑 كلمة المرور: <code>{shown}</code>"
     )
@@ -435,9 +436,8 @@ def process_text_input(chat_id, text):
         if not re.fullmatch(r"[A-Za-z0-9_]{4,24}", candidate):
             set_panel(
                 chat_id,
-                "👤 <b>اختيار اسم المستخدم</b>\n\n"
-                "اسم المستخدم غير صالح.\n"
-                "استخدم 4 إلى 24 حرفًا من الأحرف الإنكليزية أو الأرقام أو (_).",
+                "👤 <b>اكتب اسم المستخدم</b>\n\n"
+                "اسم المستخدم غير صالح.",
                 inline([[cb("🔙 إلغاء", "account")]])
             )
             return True
@@ -445,9 +445,7 @@ def process_text_input(chat_id, text):
         flow["step"] = "ichancy_password"
         set_panel(
             chat_id,
-            "🔐 <b>تعيين كلمة المرور</b>\n\n"
-            "أدخل كلمة المرور التي تريد استخدامها لتسجيل الدخول إلى حسابك.\n\n"
-            "ننصح باختيار كلمة مرور قوية والاحتفاظ بها في مكان آمن.",
+            "🔐 <b>اكتب كلمة المرور</b>",
             inline([[cb("🔙 إلغاء", "account")]])
         )
         return True
@@ -457,8 +455,8 @@ def process_text_input(chat_id, text):
         if len(password) < 6 or len(password) > 64:
             set_panel(
                 chat_id,
-                "🔐 <b>تعيين كلمة المرور</b>\n\n"
-                "كلمة المرور قصيرة جدًا. استخدم 6 أحرف على الأقل.",
+                "🔐 <b>اكتب كلمة المرور</b>\n\n"
+                "كلمة المرور قصيرة جدًا.",
                 inline([[cb("🔙 إلغاء", "account")]])
             )
             return True
@@ -467,16 +465,8 @@ def process_text_input(chat_id, text):
         u["ichancy_password"] = password
         u["password_visible"] = False
         flows.pop(chat_id, None)
-        show_account(chat_id)
-        # Keep a standalone success receipt, as agreed for important events.
-        send_message(
-            chat_id,
-            "✅ <b>تم إنشاء حساب iChancy بنجاح</b>\n\n"
-            f"👤 اسم المستخدم: <code>{html.escape(u['ichancy_username'])}</code>\n"
-            "🔑 كلمة المرور: <code>••••••••</code>\n\n"
-            "احتفظ ببيانات تسجيل الدخول الخاصة بك.\n\n"
-            "🧪 <i>هذه النسخة حاليًا لا ترسل إنشاء حقيقي إلى iChancy حتى يتم ربط الجسر.</i>"
-        )
+        # Keep everything in ONE panel: success title + credentials + buttons.
+        show_account(chat_id, created=True)
         return True
 
     if step == "withdraw_bot_amount":
@@ -587,11 +577,7 @@ def handle_callback(query):
         flows[chat_id] = {"step": "ichancy_username"}
         set_panel(
             chat_id,
-            "👤 <b>اختيار اسم المستخدم</b>\n\n"
-            "أدخل اسم المستخدم المطلوب لحساب iChancy.\n\n"
-            "• استخدم أحرفًا إنكليزية وأرقامًا فقط\n"
-            "• بدون مسافات\n"
-            "• يجب أن يكون الاسم غير مستخدم مسبقًا",
+            "👤 <b>اكتب اسم المستخدم</b>",
             inline([[cb("🔙 إلغاء", "account")]])
         )
     elif data == "ichancy_toggle_password":
