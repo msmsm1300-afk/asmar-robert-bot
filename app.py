@@ -99,20 +99,19 @@ def get_user(chat_id):
     return users[chat_id]
 
 
-def main_reply_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "🎮 حساب iChancy 🎮"}],
-            [{"text": "💳 شحن رصيد البوت"}, {"text": "💸 سحب رصيد البوت"}],
-            [{"text": "🎮 شحن حساب iChancy"}, {"text": "💸 سحب من حساب iChancy"}],
-            [{"text": "📋 سجل العمليات"}, {"text": "🎁 العروض والبونصات"}],
-            [{"text": "👥 نظام الإحالات"}, {"text": "🎟️ كود الهدية"}],
-            [{"text": "💬 الدعم والمساعدة"}, {"text": "📜 الشروط والخدمات"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-        "input_field_placeholder": "اختر خدمة من القائمة 👑",
-    }
+def main_inline_keyboard():
+    return inline([
+        [cb("🎮 حساب iChancy 🎮", "account")],
+        [cb("💳 شحن رصيد البوت", "topup"), cb("💸 سحب رصيد البوت", "withdraw_bot")],
+        [cb("🎮 شحن حساب iChancy", "ichancy_deposit"), cb("💸 سحب من حساب iChancy", "ichancy_withdraw")],
+        [cb("📋 سجل العمليات", "history"), cb("🎁 العروض والبونصات", "offers")],
+        [cb("👥 نظام الإحالات", "referrals"), cb("🎟️ كود الهدية", "gift")],
+        [cb("💬 الدعم والمساعدة", "support"), cb("📜 الشروط والخدمات", "terms")],
+    ])
+
+
+def remove_reply_keyboard():
+    return {"remove_keyboard": True}
 
 
 def inline(rows):
@@ -158,10 +157,16 @@ def set_panel(chat_id, text, reply_markup=None, force_new=False):
 
 def show_home(chat_id):
     flows.pop(chat_id, None)
-    # Main buttons remain as Telegram reply keyboard; home panel itself is simple.
-    res = send_message(chat_id, greeting(chat_id), main_reply_keyboard())
+
+    # First remove any old persistent Reply Keyboard left by previous versions.
+    # Then convert the same message into our clean Inline-Buttons home panel.
+    res = send_message(chat_id, greeting(chat_id), remove_reply_keyboard())
     if res.get("ok") and res.get("result"):
-        panel_message_ids[chat_id] = res["result"]["message_id"]
+        mid = res["result"]["message_id"]
+        panel_message_ids[chat_id] = mid
+        edited = edit_message(chat_id, mid, greeting(chat_id), main_inline_keyboard())
+        if edited.get("ok"):
+            return edited
     return res
 
 
@@ -565,7 +570,7 @@ def handle_callback(query):
 
     if data == "home":
         flows.pop(chat_id, None)
-        set_panel(chat_id, greeting(chat_id), inline([[cb("🔄 تحديث", "home")]]))
+        set_panel(chat_id, greeting(chat_id), main_inline_keyboard())
     elif data == "account":
         show_account(chat_id)
     elif data == "ichancy_create":
@@ -607,6 +612,22 @@ def handle_callback(query):
         show_withdraw_method(chat_id, "USDT")
     elif data == "wd_wish":
         show_withdraw_method(chat_id, "ويش موني")
+    elif data == "ichancy_deposit":
+        show_ichancy_deposit(chat_id)
+    elif data == "ichancy_withdraw":
+        show_ichancy_withdraw(chat_id)
+    elif data == "history":
+        show_history(chat_id)
+    elif data == "offers":
+        show_offers(chat_id)
+    elif data == "referrals":
+        show_referrals(chat_id)
+    elif data == "gift":
+        show_gift(chat_id)
+    elif data == "support":
+        show_support(chat_id)
+    elif data == "terms":
+        show_terms(chat_id)
     else:
         answer_callback(callback_id, "هذا الخيار قيد التجهيز", True)
 
@@ -678,8 +699,8 @@ def webhook():
     # Unknown text: keep user inside the designed interface.
     set_panel(
         chat_id,
-        "👑 اختر الخدمة المطلوبة من القائمة بالأسفل.",
-        inline([[cb("🔙 الرئيسية", "home")]])
+        "👑 اختر الخدمة المطلوبة من القائمة.",
+        main_inline_keyboard()
     )
     return jsonify({"ok": True})
 
