@@ -126,6 +126,11 @@ def cb(text, data):
     return {"text": text, "callback_data": data}
 
 
+def nav_row(back_data="home", back_label="🔙 رجوع"):
+    """Single inline back button. Telegram handles the native START button itself."""
+    return [cb(back_label, back_data)]
+
+
 def url_btn(text, url):
     return {"text": text, "url": url}
 
@@ -190,7 +195,7 @@ def show_account(chat_id, created=False):
         )
         markup = inline([
             [cb("➕ إنشاء حساب جديد", "ichancy_create")],
-            [cb("🔙 رجوع", "home")],
+            nav_row("home"),
         ])
         return set_panel(chat_id, text, markup)
 
@@ -209,7 +214,7 @@ def show_account(chat_id, created=False):
         [cb(toggle_label, "ichancy_toggle_password")],
         [copy_btn("📋 نسخ كلمة المرور", pwd)],
         [url_btn("🌐 الدخول إلى iChancy", "https://www.ichancy200.com")],
-        [cb("🔙 رجوع", "home")],
+        nav_row("home"),
     ])
     return set_panel(chat_id, text, markup)
 
@@ -230,7 +235,7 @@ def show_topup(chat_id):
     markup = inline([
         [cb("🟩 شام كاش", "topup_sham"), cb("🔴 سيريتيل كاش", "topup_syriatel")],
         [cb("🟢 USDT", "topup_usdt"), cb("🟣 ويش موني", "topup_wish")],
-        [cb("🔙 رجوع", "home")],
+        nav_row("home"),
     ])
     return set_panel(chat_id, text, markup)
 
@@ -243,7 +248,7 @@ def show_usdt_networks(chat_id):
     markup = inline([
         [cb("🔴 USDT TRC20", "usdt_trc20")],
         [cb("🟡 USDT BEP20", "usdt_bep20")],
-        [cb("🔙 رجوع", "topup")],
+        nav_row("topup"),
     ])
     return set_panel(chat_id, text, markup)
 
@@ -254,7 +259,7 @@ def show_payment_placeholder(chat_id, title):
         "🚧 <b>واجهة وسيلة الدفع جاهزة.</b>\n"
         "سيتم ربط التحقق التلقائي بالـAPI بعد اعتماد تصميم البوت بالكامل."
     )
-    return set_panel(chat_id, text, inline([[cb("🔙 رجوع", "topup")]]))
+    return set_panel(chat_id, text, inline([nav_row("topup")]))
 
 
 def show_withdraw_bot(chat_id):
@@ -267,7 +272,7 @@ def show_withdraw_bot(chat_id):
     markup = inline([
         [cb("🟩 شام كاش", "wd_sham"), cb("🔴 سيريتيل كاش", "wd_syriatel")],
         [cb("🟢 USDT", "wd_usdt"), cb("🟣 ويش موني", "wd_wish")],
-        [cb("🔙 رجوع", "home")],
+        nav_row("home"),
     ])
     return set_panel(chat_id, text, markup)
 
@@ -280,7 +285,7 @@ def show_withdraw_method(chat_id, method_name):
         f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n\n"
         "أدخل المبلغ المطلوب سحبه من رصيد البوت."
     )
-    return set_panel(chat_id, text, inline([[cb("🔙 إلغاء", "withdraw_bot")]]))
+    return set_panel(chat_id, text, inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
 
 
 def show_ichancy_deposit(chat_id):
@@ -292,7 +297,7 @@ def show_ichancy_deposit(chat_id):
         )
         return set_panel(chat_id, text, inline([
             [cb("🎮 إنشاء حساب iChancy", "ichancy_create")],
-            [cb("🔙 رجوع", "home")],
+            nav_row("home"),
         ]))
     flows[chat_id] = {"step": "ichancy_deposit_amount"}
     text = (
@@ -300,7 +305,7 @@ def show_ichancy_deposit(chat_id):
         f"💰 رصيدك المتاح: <b>{fmt_amount(u['balance'])}</b>\n\n"
         "أدخل المبلغ الذي ترغب بإضافته إلى حسابك."
     )
-    return set_panel(chat_id, text, inline([[cb("🔙 إلغاء", "home")]]))
+    return set_panel(chat_id, text, inline([nav_row("home", "🔙 إلغاء")]))
 
 
 def show_ichancy_withdraw(chat_id):
@@ -312,14 +317,14 @@ def show_ichancy_withdraw(chat_id):
         )
         return set_panel(chat_id, text, inline([
             [cb("🎮 إنشاء حساب iChancy", "ichancy_create")],
-            [cb("🔙 رجوع", "home")],
+            nav_row("home"),
         ]))
     # Bridge is not connected in UI prototype, so we intentionally show the approved message.
     text = (
         "⚠️ <b>الخدمة غير متاحة مؤقتًا</b>\n\n"
         "يرجى المحاولة بعد قليل."
     )
-    return set_panel(chat_id, text, inline([[cb("🔙 رجوع", "home")]]))
+    return set_panel(chat_id, text, inline([nav_row("home")]))
 
 
 def show_history(chat_id):
@@ -332,7 +337,7 @@ def show_history(chat_id):
             lines.append(item)
             lines.append("")
         text = "\n".join(lines).rstrip()
-    return set_panel(chat_id, text, inline([[cb("🔙 رجوع", "home")]]))
+    return set_panel(chat_id, text, inline([nav_row("home")]))
 
 
 def show_offers(chat_id):
@@ -347,7 +352,7 @@ def show_offers(chat_id):
     )
     return set_panel(chat_id, text, inline([
         [cb("💳 شحن رصيد البوت", "topup")],
-        [cb("🔙 رجوع", "home")],
+        nav_row("home"),
     ]))
 
 
@@ -363,7 +368,7 @@ def show_referrals(chat_id, bot_username=None):
     )
     return set_panel(chat_id, text, inline([
         [copy_btn("📋 نسخ رابط الإحالة", link)],
-        [cb("🔙 رجوع", "home")],
+        nav_row("home"),
     ]))
 
 
@@ -374,7 +379,7 @@ def show_gift(chat_id):
         "أدخل كود الهدية للاستفادة من المكافأة.\n\n"
         "كل كود صالح لاستخدام واحد فقط على مستوى البوت بالكامل."
     )
-    return set_panel(chat_id, text, inline([[cb("🔙 إلغاء", "home")]]))
+    return set_panel(chat_id, text, inline([nav_row("home", "🔙 إلغاء")]))
 
 
 def support_usernames():
@@ -396,7 +401,7 @@ def show_support(chat_id):
             rows.append([url_btn(f"👨‍💻 @{name}", f"https://t.me/{name}")])
     else:
         text += "\n\nلم تتم إضافة ممثل خدمة عملاء بعد."
-    rows.append([cb("🔙 رجوع", "home")])
+    rows.append(nav_row("home"))
     return set_panel(chat_id, text, inline(rows))
 
 
@@ -412,7 +417,7 @@ def show_terms(chat_id):
         "• نسب البونص والعروض قابلة للتغيير وتظهر داخل قسم شحن رصيد البوت.\n\n"
         "👑 شكرًا لثقتكم بخدماتنا"
     )
-    return set_panel(chat_id, text, inline([[cb("🔙 رجوع", "home")]]))
+    return set_panel(chat_id, text, inline([nav_row("home")]))
 
 
 def parse_amount(text):
@@ -438,7 +443,7 @@ def process_text_input(chat_id, text):
                 chat_id,
                 "👤 <b>اكتب اسم المستخدم</b>\n\n"
                 "اسم المستخدم غير صالح.",
-                inline([[cb("🔙 إلغاء", "account")]])
+                inline([nav_row("account", "🔙 إلغاء")])
             )
             return True
         flow["username"] = candidate
@@ -446,7 +451,7 @@ def process_text_input(chat_id, text):
         set_panel(
             chat_id,
             "🔐 <b>اكتب كلمة المرور</b>",
-            inline([[cb("🔙 إلغاء", "account")]])
+            inline([nav_row("account", "🔙 إلغاء")])
         )
         return True
 
@@ -457,7 +462,7 @@ def process_text_input(chat_id, text):
                 chat_id,
                 "🔐 <b>اكتب كلمة المرور</b>\n\n"
                 "كلمة المرور قصيرة جدًا.",
-                inline([[cb("🔙 إلغاء", "account")]])
+                inline([nav_row("account", "🔙 إلغاء")])
             )
             return True
         # UI prototype only: save locally in memory. No real iChancy request is sent.
@@ -472,7 +477,7 @@ def process_text_input(chat_id, text):
     if step == "withdraw_bot_amount":
         amount = parse_amount(text)
         if amount is None:
-            set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([[cb("🔙 إلغاء", "withdraw_bot")]]))
+            set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
             return True
         if amount > u["balance"]:
             set_panel(
@@ -495,13 +500,13 @@ def process_text_input(chat_id, text):
             "سيتم إشعارك فور اكتمال الحوالة. 👑\n\n"
             "🧪 <i>طلب تجريبي فقط، لم يتم خصم أو تحويل أي رصيد.</i>"
         )
-        set_panel(chat_id, text2, inline([[cb("🔙 رجوع", "home")]]))
+        set_panel(chat_id, text2, inline([nav_row("home")]))
         return True
 
     if step == "ichancy_deposit_amount":
         amount = parse_amount(text)
         if amount is None:
-            set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([[cb("🔙 إلغاء", "home")]]))
+            set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row("home", "🔙 إلغاء")]))
             return True
         flows.pop(chat_id, None)
         if amount > u["balance"]:
@@ -510,14 +515,14 @@ def process_text_input(chat_id, text):
                 "⚠️ <b>الرصيد غير كافٍ</b>\n\n"
                 f"رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n"
                 f"المبلغ المطلوب: <b>{fmt_amount(amount)}</b>",
-                inline([[cb("🔙 رجوع", "home")]])
+                inline([nav_row("home")])
             )
             return True
         set_panel(
             chat_id,
             "🧪 <b>الواجهة جاهزة للاختبار</b>\n\n"
             "لم يتم إرسال أي مبلغ إلى iChancy لأن الجسر لم يتم ربطه بعد.",
-            inline([[cb("🔙 رجوع", "home")]])
+            inline([nav_row("home")])
         )
         return True
 
@@ -527,7 +532,7 @@ def process_text_input(chat_id, text):
             chat_id,
             "❌ <b>كود الهدية غير صالح أو غير موجود.</b>\n\n"
             "سيتم تفعيل إدارة أكواد الهدايا عند بناء لوحة الإدارة.",
-            inline([[cb("🔙 رجوع", "home")]])
+            inline([nav_row("home")])
         )
         return True
 
@@ -578,7 +583,7 @@ def handle_callback(query):
         set_panel(
             chat_id,
             "👤 <b>اكتب اسم المستخدم</b>",
-            inline([[cb("🔙 إلغاء", "account")]])
+            inline([nav_row("account", "🔙 إلغاء")])
         )
     elif data == "ichancy_toggle_password":
         u["password_visible"] = not u.get("password_visible")
@@ -660,7 +665,7 @@ def webhook():
 
     get_user(chat_id)
 
-    if text.startswith("/start"):
+    if text.startswith("/start") or text.startswith("/menu"):
         flows.pop(chat_id, None)
         show_home(chat_id)
         return jsonify({"ok": True})
