@@ -47,6 +47,20 @@ def tg(method, payload=None, timeout=15):
         return {"ok": False}
 
 
+def ensure_native_menu():
+    """Enable Telegram's native bottom-left Menu button (القائمة).
+
+    It opens the bot command list. We keep /start first so the user can return
+    to the main panel quickly without a persistent Reply Keyboard.
+    """
+    commands = [
+        {"command": "start", "description": "القائمة الرئيسية"},
+        {"command": "menu", "description": "فتح القائمة الرئيسية"},
+    ]
+    tg("setMyCommands", {"commands": commands})
+    tg("setChatMenuButton", {"menu_button": {"type": "commands"}})
+
+
 def send_message(chat_id, text, reply_markup=None):
     payload = {
         "chat_id": chat_id,
@@ -166,6 +180,7 @@ def set_panel(chat_id, text, reply_markup=None, force_new=False):
 
 def show_home(chat_id):
     flows.pop(chat_id, None)
+    ensure_native_menu()
 
     # Remove any old persistent Reply Keyboard with a separate message.
     # Important: do NOT try to convert that same message into an Inline Keyboard;
@@ -708,6 +723,7 @@ def webhook():
 
 @app.route("/set-webhook")
 def set_webhook():
+    ensure_native_menu()
     webhook_url = f"{PUBLIC_BASE_URL}/webhook"
     response = tg("setWebhook", {
         "url": webhook_url,
