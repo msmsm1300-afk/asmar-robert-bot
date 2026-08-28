@@ -38,8 +38,12 @@ def tg(method, payload=None, timeout=15):
         return {"ok": False, "description": "BOT_TOKEN missing"}
     try:
         r = requests.post(f"{TG_API}/{method}", json=payload or {}, timeout=timeout)
-        return r.json()
-    except Exception:
+        data = r.json()
+        if not data.get("ok"):
+            print(f"Telegram API error in {method}: {data}", flush=True)
+        return data
+    except Exception as exc:
+        print(f"Telegram API exception in {method}: {exc}", flush=True)
         return {"ok": False}
 
 
@@ -158,15 +162,21 @@ def set_panel(chat_id, text, reply_markup=None, force_new=False):
 def show_home(chat_id):
     flows.pop(chat_id, None)
 
-    # First remove any old persistent Reply Keyboard left by previous versions.
-    # Then convert the same message into our clean Inline-Buttons home panel.
-    res = send_message(chat_id, greeting(chat_id), remove_reply_keyboard())
+    # Remove any old persistent Reply Keyboard with a separate message.
+    # Important: do NOT try to convert that same message into an Inline Keyboard;
+    # Telegram may treat the text as unchanged and skip the edit.
+    cleanup = send_message(chat_id, "⌨️ تم تحديث القائمة", remove_reply_keyboard())
+
+    # Always send the actual home panel as a fresh message with Inline buttons.
+    panel_message_ids.pop(chat_id, None)
+    res = send_message(chat_id, greeting(chat_id), main_inline_keyboard())
     if res.get("ok") and res.get("result"):
-        mid = res["result"]["message_id"]
-        panel_message_ids[chat_id] = mid
-        edited = edit_message(chat_id, mid, greeting(chat_id), main_inline_keyboard())
-        if edited.get("ok"):
-            return edited
+        panel_message_ids[chat_id] = res["result"]["message_id"]
+
+    # Keep the chat clean after Telegram has processed the keyboard removal.
+    if cleanup.get("ok") and cleanup.get("result"):
+        delete_message(chat_id, cleanup["result"]["message_id"])
+
     return res
 
 
