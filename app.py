@@ -48,14 +48,12 @@ def tg(method, payload=None, timeout=15):
 
 
 def ensure_native_menu():
-    """Enable Telegram's native bottom-left Menu button (القائمة).
+    """Enable Telegram's native bottom-left Menu button.
 
-    It opens the bot command list. We keep /start first so the user can return
-    to the main panel quickly without a persistent Reply Keyboard.
+    The native menu contains one ready command only: /start — START.
     """
     commands = [
-        {"command": "start", "description": "القائمة الرئيسية"},
-        {"command": "menu", "description": "فتح القائمة الرئيسية"},
+        {"command": "start", "description": "START"},
     ]
     tg("setMyCommands", {"commands": commands})
     tg("setChatMenuButton", {"menu_button": {"type": "commands"}})
