@@ -1,8 +1,13 @@
 import os
 import re
 import html
+import json
+import base64
 import hashlib
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
+from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -17,13 +22,25 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
 
 # -----------------------------------------------------------------------------
-# UI prototype state only.
-# This is intentionally temporary/in-memory for the first interface test.
-# Persistent DB + real iChancy bridge will be added after UI approval.
+# Persistent storage
 # -----------------------------------------------------------------------------
-users = {}
+# When DATABASE_URL is configured, important user data lives in PostgreSQL.
+# If DATABASE_URL is missing, the bot falls back to temporary in-memory storage
+# so the UI can still be tested safely.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+# Short-lived interface state can stay in RAM. Losing it on a deploy only means
+# the user returns to the main menu; balances/accounts remain in PostgreSQL.
 flows = {}
 panel_message_ids = {}
+password_visible = {}
+
+# UI-only fallback when no database is connected.
+users = {}
+transactions_mem = []
+bonuses_mem = {}
+_db_initialized = False
+
 
 DEFAULT_BONUSES = {
     "sham": 0,
@@ -31,6 +48,298 @@ DEFAULT_BONUSES = {
     "usdt": 0,
     "wish": 0,
 }
+
+
+
+def _fernet():
+    """Encrypt recoverable credentials at rest.
+
+    Prefer APP_ENCRYPTION_KEY when configured. For easier testing, we can derive
+    a stable key from BOT_TOKEN. Rotating BOT_TOKEN without setting a dedicated
+    APP_ENCRYPTION_KEY would make old encrypted passwords unreadable, so a
+    dedicated key is recommended before production.
+    """
+    raw = os.environ.get("APP_ENCRYPTION_KEY", "").strip()
+    if raw:
+        try:
+            return Fernet(raw.encode())
+        except Exception:
+            pass
+    digest = hashlib.sha256(BOT_TOKEN.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encrypt_secret(value):
+    if value is None:
+        return None
+    return _fernet().encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value):
+    if not value:
+        return None
+    try:
+        return _fernet().decrypt(value.encode()).decode()
+    except (InvalidToken, ValueError):
+        return None
+
+
+def db_enabled():
+    return bool(DATABASE_URL)
+
+
+def db_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def ensure_db():
+    global _db_initialized
+    if not db_enabled() or _db_initialized:
+        return
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    telegram_username TEXT,
+                    first_name TEXT,
+                    balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
+                    ichancy_username TEXT UNIQUE,
+                    ichancy_password_enc TEXT,
+                    referred_by BIGINT,
+                    referral_earnings BIGINT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id BIGSERIAL PRIMARY KEY,
+                    telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    tx_type TEXT NOT NULL,
+                    amount BIGINT NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    method TEXT,
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_transactions_user_created
+                ON transactions (telegram_id, created_at DESC)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bonuses (
+                    method TEXT PRIMARY KEY,
+                    percent INTEGER NOT NULL DEFAULT 0 CHECK (percent >= 0 AND percent <= 1000),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS support_reps (
+                    username TEXT PRIMARY KEY,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gift_codes (
+                    code TEXT PRIMARY KEY,
+                    amount BIGINT NOT NULL CHECK (amount > 0),
+                    used_by BIGINT,
+                    used_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            for method, percent in DEFAULT_BONUSES.items():
+                cur.execute(
+                    "INSERT INTO bonuses(method, percent) VALUES(%s, %s) ON CONFLICT(method) DO NOTHING",
+                    (method, percent),
+                )
+    _db_initialized = True
+
+
+def upsert_user(chat_id, telegram_username=None, first_name=None, referred_by=None):
+    if not db_enabled():
+        if chat_id not in users:
+            users[chat_id] = {
+                "balance": 0,
+                "ichancy_username": None,
+                "ichancy_password": None,
+                "referred_by": referred_by,
+                "referral_earnings": 0,
+            }
+        return
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_id FROM users WHERE telegram_id=%s", (chat_id,))
+            exists = cur.fetchone() is not None
+            safe_ref = None
+            if not exists and referred_by and int(referred_by) != int(chat_id):
+                cur.execute("SELECT telegram_id FROM users WHERE telegram_id=%s", (int(referred_by),))
+                if cur.fetchone():
+                    safe_ref = int(referred_by)
+            cur.execute("""
+                INSERT INTO users(telegram_id, telegram_username, first_name, referred_by)
+                VALUES(%s, %s, %s, %s)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    telegram_username=COALESCE(EXCLUDED.telegram_username, users.telegram_username),
+                    first_name=COALESCE(EXCLUDED.first_name, users.first_name),
+                    updated_at=NOW()
+            """, (chat_id, telegram_username, first_name, safe_ref))
+
+
+def get_user(chat_id):
+    if not db_enabled():
+        if chat_id not in users:
+            upsert_user(chat_id)
+        u = dict(users[chat_id])
+        u["password_visible"] = password_visible.get(chat_id, False)
+        return u
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE telegram_id=%s", (chat_id,))
+            row = cur.fetchone()
+    if not row:
+        upsert_user(chat_id)
+        return get_user(chat_id)
+    return {
+        "balance": int(row["balance"] or 0),
+        "ichancy_username": row["ichancy_username"],
+        "ichancy_password": decrypt_secret(row["ichancy_password_enc"]),
+        "password_visible": password_visible.get(chat_id, False),
+        "referred_by": row["referred_by"],
+        "referral_earnings": int(row["referral_earnings"] or 0),
+    }
+
+
+def set_test_balance(chat_id, amount):
+    if not db_enabled():
+        get_user(chat_id)
+        users[chat_id]["balance"] = int(amount)
+        return
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET balance=%s, updated_at=NOW() WHERE telegram_id=%s", (int(amount), chat_id))
+
+
+def save_ichancy_credentials(chat_id, username, password):
+    if not db_enabled():
+        get_user(chat_id)
+        users[chat_id]["ichancy_username"] = username
+        users[chat_id]["ichancy_password"] = password
+        return True, None
+    ensure_db()
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE users
+                    SET ichancy_username=%s, ichancy_password_enc=%s, updated_at=NOW()
+                    WHERE telegram_id=%s
+                """, (username, encrypt_secret(password), chat_id))
+        return True, None
+    except psycopg2.errors.UniqueViolation:
+        return False, "username_exists"
+
+
+def username_taken(username, except_chat_id=None):
+    if not db_enabled():
+        for cid, u in users.items():
+            if cid != except_chat_id and (u.get("ichancy_username") or "").lower() == username.lower():
+                return True
+        return False
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            if except_chat_id:
+                cur.execute("SELECT 1 FROM users WHERE LOWER(ichancy_username)=LOWER(%s) AND telegram_id<>%s LIMIT 1", (username, except_chat_id))
+            else:
+                cur.execute("SELECT 1 FROM users WHERE LOWER(ichancy_username)=LOWER(%s) LIMIT 1", (username,))
+            return cur.fetchone() is not None
+
+
+def get_bonuses():
+    if not db_enabled():
+        if not bonuses_mem:
+            bonuses_mem.update(DEFAULT_BONUSES)
+        return dict(bonuses_mem)
+    ensure_db()
+    result = dict(DEFAULT_BONUSES)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT method, percent FROM bonuses")
+            for row in cur.fetchall():
+                result[row["method"]] = int(row["percent"])
+    return result
+
+
+def add_transaction(chat_id, tx_type, amount=0, status="completed", method=None, details=None):
+    details = details or {}
+    if not db_enabled():
+        transactions_mem.append({
+            "telegram_id": chat_id,
+            "tx_type": tx_type,
+            "amount": int(amount),
+            "status": status,
+            "method": method,
+            "details": details,
+        })
+        return
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO transactions(telegram_id, tx_type, amount, status, method, details)
+                VALUES(%s, %s, %s, %s, %s, %s)
+            """, (chat_id, tx_type, int(amount), status, method, Json(details)))
+
+
+def list_transactions(chat_id, limit=10):
+    if not db_enabled():
+        items = [x for x in transactions_mem if x["telegram_id"] == chat_id]
+        return items[-limit:][::-1]
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT tx_type, amount, status, method, details, created_at
+                FROM transactions
+                WHERE telegram_id=%s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (chat_id, int(limit)))
+            return list(cur.fetchall())
+
+
+def referral_stats(chat_id):
+    if not db_enabled():
+        count = sum(1 for u in users.values() if u.get("referred_by") == chat_id)
+        return count, int(get_user(chat_id).get("referral_earnings", 0))
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM users WHERE referred_by=%s", (chat_id,))
+            count = int(cur.fetchone()["c"])
+            cur.execute("SELECT referral_earnings FROM users WHERE telegram_id=%s", (chat_id,))
+            row = cur.fetchone()
+            earnings = int(row["referral_earnings"] or 0) if row else 0
+    return count, earnings
+
+
+def db_support_usernames():
+    names = []
+    if db_enabled():
+        ensure_db()
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT username FROM support_reps WHERE is_active=TRUE ORDER BY sort_order, username")
+                names = [r["username"] for r in cur.fetchall()]
+    return names
 
 
 def tg(method, payload=None, timeout=15):
@@ -100,19 +409,6 @@ def fmt_amount(value):
         return f"{int(value):,}"
     except Exception:
         return "0"
-
-
-def get_user(chat_id):
-    if chat_id not in users:
-        users[chat_id] = {
-            "balance": 0,
-            "ichancy_username": None,
-            "ichancy_password": None,
-            "password_visible": False,
-            "bonuses": dict(DEFAULT_BONUSES),
-            "history": [],
-        }
-    return users[chat_id]
 
 
 def main_inline_keyboard():
@@ -234,7 +530,7 @@ def show_account(chat_id, created=False):
 
 def show_topup(chat_id):
     u = get_user(chat_id)
-    b = u["bonuses"]
+    b = get_bonuses()
     text = (
         "💳 <b>شحن رصيد البوت</b>\n\n"
         f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n\n"
@@ -341,20 +637,39 @@ def show_ichancy_withdraw(chat_id):
 
 
 def show_history(chat_id):
-    u = get_user(chat_id)
-    if not u["history"]:
+    items = list_transactions(chat_id, 10)
+    if not items:
         text = "📋 <b>سجل العمليات</b>\n\nلا توجد عمليات مسجلة حتى الآن."
     else:
+        labels = {
+            "test_credit": "🧪 تعديل رصيد تجريبي",
+            "bot_topup": "💳 شحن رصيد البوت",
+            "bot_withdraw": "💸 سحب رصيد البوت",
+            "ichancy_deposit": "🎮 شحن iChancy",
+            "ichancy_withdraw": "↩️ سحب من iChancy",
+            "gift": "🎟️ كود هدية",
+            "referral": "👥 مكافأة إحالة",
+        }
+        status_labels = {
+            "completed": "✅ مكتملة",
+            "pending": "⏳ قيد المعالجة",
+            "rejected": "❌ مرفوضة",
+            "refunded": "↩️ تم إرجاع الرصيد",
+        }
         lines = ["📋 <b>آخر عملياتك</b>", ""]
-        for item in u["history"][-10:][::-1]:
-            lines.append(item)
+        for item in items:
+            lines.append(labels.get(item.get("tx_type"), "🧾 عملية"))
+            lines.append(f"💰 <b>{fmt_amount(item.get('amount', 0))}</b>")
+            if item.get("method"):
+                lines.append(f"💳 {html.escape(str(item['method']))}")
+            lines.append(status_labels.get(item.get("status"), html.escape(str(item.get("status", "")))))
             lines.append("")
         text = "\n".join(lines).rstrip()
     return set_panel(chat_id, text, inline([nav_row("home")]))
 
 
 def show_offers(chat_id):
-    b = get_user(chat_id)["bonuses"]
+    b = get_bonuses()
     text = (
         "🎁 <b>العروض والبونصات الحالية</b>\n\n"
         f"🟩 شام كاش: <b>+{b['sham']}%</b>\n"
@@ -372,11 +687,12 @@ def show_offers(chat_id):
 def show_referrals(chat_id, bot_username=None):
     bot_username = bot_username or os.environ.get("BOT_USERNAME", "YourBot")
     link = f"https://t.me/{bot_username}?start=ref_{chat_id}"
+    ref_count, ref_earnings = referral_stats(chat_id)
     text = (
         "👥 <b>نظام الإحالات</b>\n\n"
         "شارك رابطك الخاص وادعُ أصدقاءك للانضمام إلى البوت.\n\n"
-        "👤 عدد الأشخاص المسجلين عن طريقك: <b>0</b>\n"
-        "💰 أرباح الإحالات: <b>0</b>\n\n"
+        f"👤 عدد الأشخاص المسجلين عن طريقك: <b>{ref_count}</b>\n"
+        f"💰 أرباح الإحالات: <b>{fmt_amount(ref_earnings)}</b>\n\n"
         f"🔗 رابط الإحالة الخاص بك:\n<code>{html.escape(link)}</code>"
     )
     return set_panel(chat_id, text, inline([
@@ -396,6 +712,9 @@ def show_gift(chat_id):
 
 
 def support_usernames():
+    result = db_support_usernames()
+    if result:
+        return result
     raw = os.environ.get("SUPPORT_USERNAMES", "")
     result = []
     for x in raw.split(","):
@@ -459,6 +778,13 @@ def process_text_input(chat_id, text):
                 inline([nav_row("account", "🔙 إلغاء")])
             )
             return True
+        if username_taken(candidate, chat_id):
+            set_panel(
+                chat_id,
+                "👤 <b>اكتب اسم المستخدم</b>\n\nاسم المستخدم مستخدم مسبقًا.",
+                inline([nav_row("account", "🔙 إلغاء")])
+            )
+            return True
         flow["username"] = candidate
         flow["step"] = "ichancy_password"
         set_panel(
@@ -478,12 +804,18 @@ def process_text_input(chat_id, text):
                 inline([nav_row("account", "🔙 إلغاء")])
             )
             return True
-        # UI prototype only: save locally in memory. No real iChancy request is sent.
-        u["ichancy_username"] = flow["username"]
-        u["ichancy_password"] = password
-        u["password_visible"] = False
+        # UI prototype only: save in our persistent DB. No real iChancy request is sent yet.
+        ok, reason = save_ichancy_credentials(chat_id, flow["username"], password)
+        if not ok:
+            flow["step"] = "ichancy_username"
+            set_panel(
+                chat_id,
+                "👤 <b>اكتب اسم المستخدم</b>\n\nاسم المستخدم مستخدم مسبقًا.",
+                inline([nav_row("account", "🔙 إلغاء")])
+            )
+            return True
+        password_visible[chat_id] = False
         flows.pop(chat_id, None)
-        # Keep everything in ONE panel: success title + credentials + buttons.
         show_account(chat_id, created=True)
         return True
 
@@ -599,7 +931,7 @@ def handle_callback(query):
             inline([nav_row("account", "🔙 إلغاء")])
         )
     elif data == "ichancy_toggle_password":
-        u["password_visible"] = not u.get("password_visible")
+        password_visible[chat_id] = not password_visible.get(chat_id, False)
         show_account(chat_id)
     elif data == "topup":
         show_topup(chat_id)
@@ -646,14 +978,20 @@ def handle_callback(query):
         answer_callback(callback_id, "هذا الخيار قيد التجهيز", True)
 
 
+@app.before_request
+def prepare_storage():
+    if db_enabled():
+        ensure_db()
+
+
 @app.route("/")
 def home():
-    return "Asmar Robert Bot UI prototype is running ✅"
+    return "Asmar Robert Bot UI + persistent storage is running ✅"
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "mode": "ui-prototype"})
+    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory"})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -676,7 +1014,20 @@ def webhook():
     if not chat_id:
         return jsonify({"ok": True})
 
-    get_user(chat_id)
+    sender = message.get("from") or {}
+    referrer_id = None
+    if text.startswith("/start"):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2 and parts[1].startswith("ref_"):
+            raw_ref = parts[1][4:]
+            if raw_ref.isdigit():
+                referrer_id = int(raw_ref)
+    upsert_user(
+        chat_id,
+        telegram_username=sender.get("username"),
+        first_name=sender.get("first_name"),
+        referred_by=referrer_id,
+    )
 
     if text.startswith("/start") or text.startswith("/menu"):
         flows.pop(chat_id, None)
@@ -694,7 +1045,8 @@ def webhook():
         if len(parts) == 2:
             amount = parse_amount(parts[1])
             if amount is not None:
-                get_user(chat_id)["balance"] = amount
+                set_test_balance(chat_id, amount)
+                add_transaction(chat_id, "test_credit", amount, "completed", "admin-test")
                 send_message(chat_id, f"🧪 تم ضبط الرصيد التجريبي إلى <b>{fmt_amount(amount)}</b>")
                 return jsonify({"ok": True})
         send_message(chat_id, "الاستخدام: <code>/testcredit 200000</code>")
