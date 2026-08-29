@@ -10,6 +10,7 @@ import time
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -71,6 +72,14 @@ DEFAULT_BONUSES = {
     "usdt": 0,
     "wish": 0,
 }
+
+# V17 transaction minimums. Funding minimums are in the currency the customer
+# actually sends. Bot/iChancy minimums are in bot-balance units.
+MIN_TOPUP_SYP = 20_000
+MIN_TOPUP_USD = Decimal("2")
+MIN_BOT_WITHDRAW = 20_000
+MIN_ICHANCY_DEPOSIT = 20_000
+MIN_ICHANCY_WITHDRAW = 50_000
 
 
 
@@ -741,11 +750,16 @@ def set_panel(chat_id, text, reply_markup=None, force_new=False):
     return res
 
 
-def show_home(chat_id):
+def show_home(chat_id, force_new=False):
     flows.pop(chat_id, None)
-    # V12 keeps /start lightweight: one Telegram edit/send only. Native menu is
-    # configured by /set-webhook and does not need two extra API calls per start.
-    return set_panel(chat_id, greeting(chat_id), main_inline_keyboard())
+    # /start can force a fresh message below the command. Inline navigation still
+    # edits the active panel to keep normal browsing clean and fast.
+    return set_panel(
+        chat_id,
+        greeting(chat_id),
+        main_inline_keyboard(),
+        force_new=force_new,
+    )
 
 
 def show_account(chat_id, created=False):
@@ -789,16 +803,29 @@ def show_topup(chat_id):
         "💳 <b>شحن رصيد البوت</b>\n\n"
         f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n\n"
         "🎁 <b>البونصات المتاحة حاليًا</b>\n"
-        f"🟩 شام كاش: <b>+{b['sham']}%</b>\n"
+        f"💸 Sham Cash: <b>+{b['sham']}%</b>\n"
         f"🔴 سيريتيل كاش: <b>+{b['syriatel']}%</b>\n"
         f"🟢 USDT: <b>+{b['usdt']}%</b>\n"
         f"🟣 Wish Money: <b>+{b['wish']}%</b>\n\n"
         "اختر وسيلة الشحن المناسبة:"
     )
     markup = inline([
-        [cb("🟩 شام كاش", "topup_sham"), cb("🔴 سيريتيل كاش", "topup_syriatel")],
+        [cb("💸 Sham Cash", "topup_sham"), cb("🔴 Syriatel Cash", "topup_syriatel")],
         [cb("🟢 USDT", "topup_usdt"), cb("🟣 Wish Money", "topup_wish")],
         nav_row("home"),
+    ])
+    return set_panel(chat_id, text, markup)
+
+
+def show_sham_cash_currency(chat_id):
+    text = (
+        "💸 <b>Sham Cash</b>\n\n"
+        "اختر العملة التي تريد الإيداع بها:"
+    )
+    markup = inline([
+        [cb("💸 Sham Cash ليرة", "topup_sham_syp")],
+        [cb("💲 Sham Cash Dollar", "topup_sham_usd")],
+        nav_row("topup"),
     ])
     return set_panel(chat_id, text, markup)
 
@@ -806,6 +833,7 @@ def show_topup(chat_id):
 def show_usdt_networks(chat_id):
     text = (
         "🟢 <b>الشحن عبر USDT</b>\n\n"
+        "💵 الحد الأدنى للإيداع: <b>$2</b>\n\n"
         "اختر شبكة التحويل:"
     )
     markup = inline([
@@ -816,11 +844,39 @@ def show_usdt_networks(chat_id):
     return set_panel(chat_id, text, markup)
 
 
-def show_payment_placeholder(chat_id, title):
+def show_topup_amount_prompt(chat_id, method_name, currency, minimum, back_data="topup"):
+    flows[chat_id] = {
+        "step": "bot_topup_amount",
+        "method": method_name,
+        "currency": currency,
+        "minimum": str(minimum),
+        "back_data": back_data,
+    }
+    if currency == "SYP":
+        minimum_text = f"{fmt_amount(minimum)} ل.س"
+        prompt = "أدخل مبلغ الإيداع بالليرة السورية."
+    else:
+        minimum_text = f"${minimum}"
+        prompt = "أدخل مبلغ الإيداع بالدولار."
     text = (
-        f"{title}\n\n"
-        "🚧 <b>واجهة وسيلة الدفع جاهزة.</b>\n"
-        "سيتم ربط التحقق التلقائي بالـAPI بعد اعتماد تصميم البوت بالكامل."
+        f"💳 <b>{html.escape(method_name)}</b>\n\n"
+        f"🔻 الحد الأدنى للإيداع: <b>{minimum_text}</b>\n\n"
+        f"{prompt}"
+    )
+    return set_panel(chat_id, text, inline([nav_row(back_data, "🔙 إلغاء")]))
+
+
+def show_topup_ready(chat_id, method_name, currency, amount):
+    # Temporary final screen until the payment API + image/instructions are wired.
+    if currency == "SYP":
+        amount_text = f"{fmt_amount(int(amount))} ل.س"
+    else:
+        amount_text = f"${format(amount, 'f').rstrip('0').rstrip('.')}"
+    text = (
+        "✅ <b>تم قبول المبلغ</b>\n\n"
+        f"💳 الطريقة: <b>{html.escape(method_name)}</b>\n"
+        f"💰 المبلغ: <b>{amount_text}</b>\n\n"
+        "🚧 سيتم إضافة صورة وتعليمات التحويل والتحقق التلقائي لهذه الطريقة لاحقًا."
     )
     return set_panel(chat_id, text, inline([nav_row("topup")]))
 
@@ -845,7 +901,8 @@ def show_withdraw_method(chat_id, method_name):
     flows[chat_id] = {"step": "withdraw_bot_amount", "method": method_name}
     text = (
         f"💸 <b>السحب عبر {html.escape(method_name)}</b>\n\n"
-        f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n\n"
+        f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n"
+        f"🔻 الحد الأدنى للسحب: <b>{fmt_amount(MIN_BOT_WITHDRAW)}</b>\n\n"
         "أدخل المبلغ المطلوب سحبه من رصيد البوت."
     )
     return set_panel(chat_id, text, inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
@@ -865,7 +922,8 @@ def show_ichancy_deposit(chat_id):
     flows[chat_id] = {"step": "ichancy_deposit_amount"}
     text = (
         "🎮 <b>شحن حساب iChancy</b>\n\n"
-        f"💰 رصيدك المتاح: <b>{fmt_amount(u['balance'])}</b>\n\n"
+        f"💰 رصيدك المتاح: <b>{fmt_amount(u['balance'])}</b>\n"
+        f"🔻 الحد الأدنى للشحن: <b>{fmt_amount(MIN_ICHANCY_DEPOSIT)}</b>\n\n"
         "أدخل المبلغ الذي ترغب بإضافته إلى حسابك."
     )
     return set_panel(chat_id, text, inline([nav_row("home", "🔙 إلغاء")]))
@@ -882,9 +940,10 @@ def show_ichancy_withdraw(chat_id):
             [cb("🎮 إنشاء حساب iChancy", "ichancy_create")],
             nav_row("home"),
         ]))
-    # Bridge is not connected in UI prototype, so we intentionally show the approved message.
+    # Bridge is not connected in this UI prototype yet.
     text = (
         "⚠️ <b>الخدمة غير متاحة مؤقتًا</b>\n\n"
+        f"🔻 الحد الأدنى للسحب من iChancy: <b>{fmt_amount(MIN_ICHANCY_WITHDRAW)}</b>\n\n"
         "يرجى المحاولة بعد قليل."
     )
     return set_panel(chat_id, text, inline([nav_row("home")]))
@@ -1013,7 +1072,7 @@ def show_offers(chat_id):
     b = get_bonuses()
     text = (
         "🎁 <b>العروض والبونصات الحالية</b>\n\n"
-        f"🟩 شام كاش: <b>+{b['sham']}%</b>\n"
+        f"💸 Sham Cash: <b>+{b['sham']}%</b>\n"
         f"🔴 سيريتيل كاش: <b>+{b['syriatel']}%</b>\n"
         f"🟢 USDT: <b>+{b['usdt']}%</b>\n"
         f"🟣 Wish Money: <b>+{b['wish']}%</b>\n\n"
@@ -1118,6 +1177,17 @@ def parse_amount(text):
     return value if value > 0 else None
 
 
+def parse_decimal_amount(text):
+    cleaned = text.replace(",", "").replace(" ", "").strip()
+    try:
+        value = Decimal(cleaned)
+    except (InvalidOperation, ValueError):
+        return None
+    if value <= 0 or value.as_tuple().exponent < -2:
+        return None
+    return value
+
+
 def process_text_input(chat_id, text):
     flow = flows.get(chat_id)
     if not flow:
@@ -1177,10 +1247,59 @@ def process_text_input(chat_id, text):
         show_account(chat_id, created=True)
         return True
 
+    if step == "bot_topup_amount":
+        currency = flow.get("currency")
+        method = flow.get("method", "غير محدد")
+        back_data = flow.get("back_data", "topup")
+
+        if currency == "SYP":
+            amount = parse_amount(text)
+            minimum = int(Decimal(flow.get("minimum", str(MIN_TOPUP_SYP))))
+            if amount is None:
+                set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row(back_data, "🔙 إلغاء")]))
+                return True
+            if amount < minimum:
+                set_panel(
+                    chat_id,
+                    f"❌ <b>الحد الأدنى للإيداع هو {fmt_amount(minimum)} ل.س</b>\n\nأدخل مبلغًا أعلى.",
+                    inline([nav_row(back_data, "🔙 إلغاء")])
+                )
+                return True
+            flows.pop(chat_id, None)
+            show_topup_ready(chat_id, method, currency, Decimal(amount))
+            return True
+
+        amount = parse_decimal_amount(text)
+        minimum = Decimal(flow.get("minimum", str(MIN_TOPUP_USD)))
+        if amount is None:
+            set_panel(
+                chat_id,
+                "⚠️ أدخل مبلغًا صحيحًا، مثال: <code>2</code> أو <code>2.5</code>.",
+                inline([nav_row(back_data, "🔙 إلغاء")])
+            )
+            return True
+        if amount < minimum:
+            set_panel(
+                chat_id,
+                f"❌ <b>الحد الأدنى للإيداع هو ${minimum}</b>\n\nأدخل مبلغًا أعلى.",
+                inline([nav_row(back_data, "🔙 إلغاء")])
+            )
+            return True
+        flows.pop(chat_id, None)
+        show_topup_ready(chat_id, method, currency, amount)
+        return True
+
     if step == "withdraw_bot_amount":
         amount = parse_amount(text)
         if amount is None:
             set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
+            return True
+        if amount < MIN_BOT_WITHDRAW:
+            set_panel(
+                chat_id,
+                f"❌ <b>الحد الأدنى للسحب هو {fmt_amount(MIN_BOT_WITHDRAW)}</b>\n\nأدخل مبلغًا أعلى.",
+                inline([nav_row("withdraw_bot", "🔙 إلغاء")])
+            )
             return True
         if amount > u["balance"]:
             set_panel(
@@ -1210,6 +1329,13 @@ def process_text_input(chat_id, text):
         amount = parse_amount(text)
         if amount is None:
             set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row("home", "🔙 إلغاء")]))
+            return True
+        if amount < MIN_ICHANCY_DEPOSIT:
+            set_panel(
+                chat_id,
+                f"❌ <b>الحد الأدنى لشحن iChancy هو {fmt_amount(MIN_ICHANCY_DEPOSIT)}</b>\n\nأدخل مبلغًا أعلى.",
+                inline([nav_row("home", "🔙 إلغاء")])
+            )
             return True
         flows.pop(chat_id, None)
         if amount > u["balance"]:
@@ -1310,15 +1436,19 @@ def handle_callback(query):
     elif data == "topup_usdt":
         show_usdt_networks(chat_id)
     elif data == "topup_sham":
-        show_payment_placeholder(chat_id, "🟩 <b>الشحن عبر شام كاش</b>")
+        show_sham_cash_currency(chat_id)
+    elif data == "topup_sham_syp":
+        show_topup_amount_prompt(chat_id, "Sham Cash ليرة", "SYP", MIN_TOPUP_SYP, "topup_sham")
+    elif data == "topup_sham_usd":
+        show_topup_amount_prompt(chat_id, "Sham Cash Dollar", "USD", MIN_TOPUP_USD, "topup_sham")
     elif data == "topup_syriatel":
-        show_payment_placeholder(chat_id, "🔴 <b>الشحن عبر سيريتيل كاش</b>")
+        show_topup_amount_prompt(chat_id, "Syriatel Cash", "SYP", MIN_TOPUP_SYP, "topup")
     elif data == "topup_wish":
-        show_payment_placeholder(chat_id, "🟣 <b>الشحن عبر Wish Money</b>")
+        show_topup_amount_prompt(chat_id, "Wish Money", "USD", MIN_TOPUP_USD, "topup")
     elif data == "usdt_trc20":
-        show_payment_placeholder(chat_id, "🔴 <b>USDT - TRC20</b>")
+        show_topup_amount_prompt(chat_id, "USDT - TRC20", "USD", MIN_TOPUP_USD, "topup_usdt")
     elif data == "usdt_bep20":
-        show_payment_placeholder(chat_id, "🟡 <b>USDT - BEP20</b>")
+        show_topup_amount_prompt(chat_id, "USDT - BEP20", "USD", MIN_TOPUP_USD, "topup_usdt")
     elif data == "withdraw_bot":
         flows.pop(chat_id, None)
         show_withdraw_bot(chat_id)
@@ -1366,12 +1496,12 @@ def prepare_storage():
 
 @app.route("/")
 def home():
-    return "Asmar Robert Bot UI + PostgreSQL ledger v15 is running ✅"
+    return "Asmar Robert Bot UI + PostgreSQL ledger v16 is running ✅"
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory", "ledger": "v15-account-flow-fix"})
+    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory", "ledger": "v17-sham-cash-menu"})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1423,7 +1553,9 @@ def webhook():
 
     if text.startswith("/start") or text.startswith("/menu"):
         flows.pop(chat_id, None)
-        show_home(chat_id)
+        # Always send a NEW home message under /start instead of editing an old
+        # menu above in the conversation.
+        show_home(chat_id, force_new=True)
         return jsonify({"ok": True})
 
     if text == "/myid":
