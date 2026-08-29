@@ -4,6 +4,12 @@ import html
 import json
 import base64
 import hashlib
+import secrets
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -124,6 +130,21 @@ def ensure_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            # Safe in-place migration for older V9 databases. No existing data is deleted.
+            cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_code TEXT")
+            cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS balance_before BIGINT")
+            cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS balance_after BIGINT")
+            cur.execute("""
+                UPDATE transactions
+                SET tx_code = 'TX-' || TO_CHAR(created_at, 'YYMMDD') || '-' ||
+                    UPPER(SUBSTR(MD5(id::text || random()::text), 1, 8))
+                WHERE tx_code IS NULL
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_tx_code
+                ON transactions (tx_code)
+                WHERE tx_code IS NOT NULL
+            """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_transactions_user_created
                 ON transactions (telegram_id, created_at DESC)
@@ -216,103 +237,127 @@ def get_user(chat_id):
     }
 
 
-def set_test_balance(chat_id, amount):
-    if not db_enabled():
-        get_user(chat_id)
-        users[chat_id]["balance"] = int(amount)
-        return
-    ensure_db()
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET balance=%s, updated_at=NOW() WHERE telegram_id=%s", (int(amount), chat_id))
+def make_tx_code(prefix="TX"):
+    now = datetime.now(timezone.utc)
+    return f"{prefix}-{now.strftime('%y%m%d')}-{secrets.token_hex(4).upper()}"
 
 
-def save_ichancy_credentials(chat_id, username, password):
-    if not db_enabled():
-        get_user(chat_id)
-        users[chat_id]["ichancy_username"] = username
-        users[chat_id]["ichancy_password"] = password
-        return True, None
-    ensure_db()
-    try:
-        with db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE users
-                    SET ichancy_username=%s, ichancy_password_enc=%s, updated_at=NOW()
-                    WHERE telegram_id=%s
-                """, (username, encrypt_secret(password), chat_id))
-        return True, None
-    except psycopg2.errors.UniqueViolation:
-        return False, "username_exists"
+def add_transaction(chat_id, tx_type, amount=0, status="completed", method=None, details=None,
+                    balance_before=None, balance_after=None, conn=None):
+    """Write one immutable ledger row and return its public reference code.
 
-
-def username_taken(username, except_chat_id=None):
-    if not db_enabled():
-        for cid, u in users.items():
-            if cid != except_chat_id and (u.get("ichancy_username") or "").lower() == username.lower():
-                return True
-        return False
-    ensure_db()
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            if except_chat_id:
-                cur.execute("SELECT 1 FROM users WHERE LOWER(ichancy_username)=LOWER(%s) AND telegram_id<>%s LIMIT 1", (username, except_chat_id))
-            else:
-                cur.execute("SELECT 1 FROM users WHERE LOWER(ichancy_username)=LOWER(%s) LIMIT 1", (username,))
-            return cur.fetchone() is not None
-
-
-def get_bonuses():
-    if not db_enabled():
-        if not bonuses_mem:
-            bonuses_mem.update(DEFAULT_BONUSES)
-        return dict(bonuses_mem)
-    ensure_db()
-    result = dict(DEFAULT_BONUSES)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT method, percent FROM bonuses")
-            for row in cur.fetchall():
-                result[row["method"]] = int(row["percent"])
-    return result
-
-
-def add_transaction(chat_id, tx_type, amount=0, status="completed", method=None, details=None):
+    If an existing DB connection is supplied, the insert participates in the same
+    atomic transaction as the balance change. This is the pattern future real
+    deposit/withdraw handlers should use.
+    """
     details = details or {}
+    tx_code = make_tx_code()
     if not db_enabled():
         transactions_mem.append({
             "telegram_id": chat_id,
+            "tx_code": tx_code,
             "tx_type": tx_type,
             "amount": int(amount),
             "status": status,
             "method": method,
             "details": details,
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+            "created_at": datetime.now(timezone.utc),
         })
-        return
+        return tx_code
+
+    ensure_db()
+
+    def _insert(connection):
+        with connection.cursor() as cur:
+            # Extremely unlikely collision, but retry safely if it ever happens.
+            code = tx_code
+            for _ in range(3):
+                try:
+                    cur.execute("""
+                        INSERT INTO transactions(
+                            telegram_id, tx_code, tx_type, amount, status, method, details,
+                            balance_before, balance_after
+                        )
+                        VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        chat_id, code, tx_type, int(amount), status, method, Json(details),
+                        balance_before, balance_after
+                    ))
+                    return code
+                except psycopg2.errors.UniqueViolation:
+                    connection.rollback()
+                    code = make_tx_code()
+            raise RuntimeError("could not generate unique transaction code")
+
+    if conn is not None:
+        return _insert(conn)
+    with db_conn() as connection:
+        return _insert(connection)
+
+
+def set_test_balance_with_ledger(chat_id, amount):
+    """Admin-only test helper: balance update + ledger entry in one DB transaction."""
+    amount = int(amount)
+    if not db_enabled():
+        u = get_user(chat_id)
+        before = int(u.get("balance", 0))
+        users[chat_id]["balance"] = amount
+        code = add_transaction(
+            chat_id, "test_credit", abs(amount - before), "completed", "admin-test",
+            {"note": "UI test balance set"}, before, amount
+        )
+        return before, amount, code
+
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO transactions(telegram_id, tx_type, amount, status, method, details)
-                VALUES(%s, %s, %s, %s, %s, %s)
-            """, (chat_id, tx_type, int(amount), status, method, Json(details)))
+            cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (chat_id,))
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("user missing")
+            before = int(row["balance"] or 0)
+            cur.execute(
+                "UPDATE users SET balance=%s, updated_at=NOW() WHERE telegram_id=%s",
+                (amount, chat_id),
+            )
+        code = add_transaction(
+            chat_id, "test_credit", abs(amount - before), "completed", "admin-test",
+            {"note": "UI test balance set"}, before, amount, conn=conn
+        )
+    return before, amount, code
 
 
-def list_transactions(chat_id, limit=10):
+def list_transactions(chat_id, limit=10, offset=0, tx_types=None):
+    tx_types = list(tx_types or [])
     if not db_enabled():
         items = [x for x in transactions_mem if x["telegram_id"] == chat_id]
-        return items[-limit:][::-1]
+        if tx_types:
+            items = [x for x in items if x.get("tx_type") in tx_types]
+        items = items[::-1]
+        return items[int(offset):int(offset) + int(limit)]
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT tx_type, amount, status, method, details, created_at
-                FROM transactions
-                WHERE telegram_id=%s
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (chat_id, int(limit)))
+            if tx_types:
+                cur.execute("""
+                    SELECT tx_code, tx_type, amount, status, method, details,
+                           balance_before, balance_after, created_at
+                    FROM transactions
+                    WHERE telegram_id=%s AND tx_type = ANY(%s)
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (chat_id, tx_types, int(limit), int(offset)))
+            else:
+                cur.execute("""
+                    SELECT tx_code, tx_type, amount, status, method, details,
+                           balance_before, balance_after, created_at
+                    FROM transactions
+                    WHERE telegram_id=%s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (chat_id, int(limit), int(offset)))
             return list(cur.fetchall())
 
 
@@ -637,35 +682,122 @@ def show_ichancy_withdraw(chat_id):
 
 
 def show_history(chat_id):
-    items = list_transactions(chat_id, 10)
+    text = "📋 <b>سجل العمليات</b>\n\nاختر نوع العمليات:"
+    markup = inline([
+        [cb("💳 شحن رصيد البوت", "history:bot_topup:0")],
+        [cb("💸 سحب رصيد البوت", "history:bot_withdraw:0")],
+        [cb("🎮 شحن iChancy", "history:ichancy_deposit:0")],
+        [cb("↩️ سحب من iChancy", "history:ichancy_withdraw:0")],
+        [cb("📋 جميع العمليات", "history:all:0")],
+        nav_row("home"),
+    ])
+    return set_panel(chat_id, text, markup)
+
+
+def _history_types(filter_name):
+    mapping = {
+        "bot_topup": ["bot_topup"],
+        "bot_withdraw": ["bot_withdraw"],
+        "ichancy_deposit": ["ichancy_deposit"],
+        "ichancy_withdraw": ["ichancy_withdraw"],
+    }
+    return mapping.get(filter_name, [])
+
+
+def _history_title(filter_name):
+    return {
+        "bot_topup": "💳 شحن رصيد البوت",
+        "bot_withdraw": "💸 سحب رصيد البوت",
+        "ichancy_deposit": "🎮 شحن iChancy",
+        "ichancy_withdraw": "↩️ سحب من iChancy",
+        "all": "📋 جميع العمليات",
+    }.get(filter_name, "📋 جميع العمليات")
+
+
+def _local_time(value):
+    if not value:
+        return "-"
+    try:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        if ZoneInfo:
+            value = value.astimezone(ZoneInfo("Asia/Damascus"))
+        else:
+            value = value.astimezone(timezone(timedelta(hours=3)))
+        return value.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(value)[:16]
+
+
+def _amount_prefix(item):
+    tx_type = item.get("tx_type")
+    if tx_type in {"bot_topup", "ichancy_withdraw", "gift", "referral"}:
+        return "+"
+    if tx_type in {"bot_withdraw", "ichancy_deposit"}:
+        return "-"
+    if tx_type == "test_credit":
+        before = item.get("balance_before")
+        after = item.get("balance_after")
+        if before is not None and after is not None:
+            return "+" if int(after) >= int(before) else "-"
+    return ""
+
+
+def show_history_page(chat_id, filter_name="all", page=0):
+    page = max(0, int(page))
+    per_page = 10
+    types = _history_types(filter_name)
+    # Fetch one extra row only to know whether a Next button is needed.
+    items = list_transactions(chat_id, per_page + 1, page * per_page, types)
+    has_next = len(items) > per_page
+    items = items[:per_page]
+
+    labels = {
+        "test_credit": "🧪 تعديل رصيد تجريبي",
+        "bot_topup": "💳 شحن رصيد البوت",
+        "bot_withdraw": "💸 سحب رصيد البوت",
+        "ichancy_deposit": "🎮 شحن iChancy",
+        "ichancy_withdraw": "↩️ سحب من iChancy",
+        "gift": "🎟️ كود هدية",
+        "referral": "👥 مكافأة إحالة",
+    }
+    status_labels = {
+        "completed": "✅ مكتملة",
+        "pending": "⏳ قيد المعالجة",
+        "approved": "🟡 مقبولة",
+        "rejected": "❌ مرفوضة",
+        "refunded": "↩️ تم إرجاع الرصيد",
+        "failed": "❌ فشلت",
+    }
+
+    lines = [f"{_history_title(filter_name)}", ""]
     if not items:
-        text = "📋 <b>سجل العمليات</b>\n\nلا توجد عمليات مسجلة حتى الآن."
+        lines.append("لا توجد عمليات مسجلة.")
     else:
-        labels = {
-            "test_credit": "🧪 تعديل رصيد تجريبي",
-            "bot_topup": "💳 شحن رصيد البوت",
-            "bot_withdraw": "💸 سحب رصيد البوت",
-            "ichancy_deposit": "🎮 شحن iChancy",
-            "ichancy_withdraw": "↩️ سحب من iChancy",
-            "gift": "🎟️ كود هدية",
-            "referral": "👥 مكافأة إحالة",
-        }
-        status_labels = {
-            "completed": "✅ مكتملة",
-            "pending": "⏳ قيد المعالجة",
-            "rejected": "❌ مرفوضة",
-            "refunded": "↩️ تم إرجاع الرصيد",
-        }
-        lines = ["📋 <b>آخر عملياتك</b>", ""]
-        for item in items:
+        for idx, item in enumerate(items):
             lines.append(labels.get(item.get("tx_type"), "🧾 عملية"))
-            lines.append(f"💰 <b>{fmt_amount(item.get('amount', 0))}</b>")
+            prefix = _amount_prefix(item)
+            lines.append(f"💰 <b>{prefix}{fmt_amount(item.get('amount', 0))}</b>")
             if item.get("method"):
                 lines.append(f"💳 {html.escape(str(item['method']))}")
             lines.append(status_labels.get(item.get("status"), html.escape(str(item.get("status", "")))))
-            lines.append("")
-        text = "\n".join(lines).rstrip()
-    return set_panel(chat_id, text, inline([nav_row("home")]))
+            if item.get("tx_code"):
+                lines.append(f"🧾 <code>{html.escape(str(item['tx_code']))}</code>")
+            lines.append(f"🕒 {_local_time(item.get('created_at'))}")
+            if idx != len(items) - 1:
+                lines.append("────────────")
+
+    rows = []
+    paging = []
+    if page > 0:
+        paging.append(cb("⬅️ السابق", f"history:{filter_name}:{page-1}"))
+    if has_next:
+        paging.append(cb("التالي ➡️", f"history:{filter_name}:{page+1}"))
+    if paging:
+        rows.append(paging)
+    rows.append([cb("📋 أنواع العمليات", "history")])
+    rows.append(nav_row("home"))
+    return set_panel(chat_id, "\n".join(lines), inline(rows))
 
 
 def show_offers(chat_id):
@@ -964,6 +1096,14 @@ def handle_callback(query):
         show_ichancy_withdraw(chat_id)
     elif data == "history":
         show_history(chat_id)
+    elif data.startswith("history:"):
+        parts = data.split(":")
+        filter_name = parts[1] if len(parts) > 1 else "all"
+        try:
+            page = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            page = 0
+        show_history_page(chat_id, filter_name, page)
     elif data == "offers":
         show_offers(chat_id)
     elif data == "referrals":
@@ -986,12 +1126,12 @@ def prepare_storage():
 
 @app.route("/")
 def home():
-    return "Asmar Robert Bot UI + persistent storage is running ✅"
+    return "Asmar Robert Bot UI + PostgreSQL ledger is running ✅"
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory"})
+    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory", "ledger": "v10"})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1045,9 +1185,13 @@ def webhook():
         if len(parts) == 2:
             amount = parse_amount(parts[1])
             if amount is not None:
-                set_test_balance(chat_id, amount)
-                add_transaction(chat_id, "test_credit", amount, "completed", "admin-test")
-                send_message(chat_id, f"🧪 تم ضبط الرصيد التجريبي إلى <b>{fmt_amount(amount)}</b>")
+                before, after, code = set_test_balance_with_ledger(chat_id, amount)
+                send_message(
+                    chat_id,
+                    "🧪 تم ضبط الرصيد التجريبي\n"
+                    f"💰 الرصيد: <b>{fmt_amount(after)}</b>\n"
+                    f"🧾 <code>{code}</code>"
+                )
                 return jsonify({"ok": True})
         send_message(chat_id, "الاستخدام: <code>/testcredit 200000</code>")
         return jsonify({"ok": True})
