@@ -5,6 +5,10 @@ import json
 import base64
 import hashlib
 import secrets
+import traceback
+import time
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 try:
     from zoneinfo import ZoneInfo
@@ -13,6 +17,8 @@ except ImportError:
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
+from psycopg2.pool import ThreadedConnectionPool
+from requests.adapters import HTTPAdapter
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, request, jsonify
 
@@ -26,6 +32,17 @@ PUBLIC_BASE_URL = os.environ.get(
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
+
+# Reuse HTTPS connections to Telegram instead of performing a new TLS handshake
+# for every button press. This noticeably improves inline-button latency.
+TG_SESSION = requests.Session()
+TG_ADAPTER = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0)
+TG_SESSION.mount("https://", TG_ADAPTER)
+
+_DB_POOL = None
+_DB_POOL_LOCK = threading.Lock()
+_BONUS_CACHE = {"expires": 0.0, "value": dict()}
+_SUPPORT_CACHE = {"expires": 0.0, "value": []}
 
 # -----------------------------------------------------------------------------
 # Persistent storage
@@ -94,8 +111,52 @@ def db_enabled():
     return bool(DATABASE_URL)
 
 
+def _get_db_pool():
+    global _DB_POOL
+    if _DB_POOL is not None:
+        return _DB_POOL
+    with _DB_POOL_LOCK:
+        if _DB_POOL is None:
+            _DB_POOL = ThreadedConnectionPool(
+                1, 8, DATABASE_URL,
+                cursor_factory=RealDictCursor,
+                connect_timeout=4,
+                application_name="asmar-robert-customer-bot",
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+            )
+    return _DB_POOL
+
+
+@contextmanager
 def db_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    """Borrow one PostgreSQL connection and always return it to the pool.
+
+    V11 created a fresh connection on many button presses without explicitly
+    closing it. Over time those connections accumulated and could make callbacks
+    appear frozen. V12 fixes that leak and reuses a small bounded pool.
+    """
+    pool = _get_db_pool()
+    conn = pool.getconn()
+    broken = False
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            broken = True
+        raise
+    finally:
+        try:
+            if conn.closed:
+                broken = True
+        except Exception:
+            broken = True
+        pool.putconn(conn, close=broken)
 
 
 def ensure_db():
@@ -179,6 +240,32 @@ def ensure_db():
                     (method, percent),
                 )
     _db_initialized = True
+
+
+def get_bonuses():
+    """Read current bonus percentages with a tiny cache for fast menus."""
+    values = dict(DEFAULT_BONUSES)
+    if not db_enabled():
+        values.update({k: int(v) for k, v in bonuses_mem.items() if k in values})
+        return values
+
+    now = time.monotonic()
+    cached = _BONUS_CACHE.get("value") or {}
+    if cached and now < float(_BONUS_CACHE.get("expires", 0)):
+        values.update(cached)
+        return values
+
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT method, percent FROM bonuses")
+            for row in cur.fetchall():
+                method = row.get("method")
+                if method in values:
+                    values[method] = int(row.get("percent") or 0)
+    _BONUS_CACHE["value"] = dict(values)
+    _BONUS_CACHE["expires"] = now + 3.0
+    return values
 
 
 def upsert_user(chat_id, telegram_username=None, first_name=None, referred_by=None):
@@ -297,6 +384,77 @@ def add_transaction(chat_id, tx_type, amount=0, status="completed", method=None,
         return _insert(connection)
 
 
+def redeem_gift_code(chat_id, raw_code):
+    """Redeem one globally single-use gift code atomically.
+
+    The code row is locked while it is checked and consumed, so two users
+    cannot successfully redeem the same code at the same time. The balance
+    credit and ledger entry commit in the same PostgreSQL transaction.
+    """
+    code = (raw_code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+        return {"ok": False, "reason": "invalid"}
+
+    if not db_enabled():
+        return {"ok": False, "reason": "storage_unavailable"}
+
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, amount, used_by, used_at FROM gift_codes WHERE code=%s FOR UPDATE",
+                (code,),
+            )
+            gift = cur.fetchone()
+            if not gift:
+                return {"ok": False, "reason": "invalid"}
+            if gift["used_by"] is not None:
+                return {"ok": False, "reason": "used"}
+
+            cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (chat_id,))
+            user = cur.fetchone()
+            if not user:
+                raise RuntimeError("user missing")
+
+            amount = int(gift["amount"] or 0)
+            if amount <= 0:
+                return {"ok": False, "reason": "invalid"}
+
+            before = int(user["balance"] or 0)
+            after = before + amount
+            cur.execute(
+                "UPDATE users SET balance=%s, updated_at=NOW() WHERE telegram_id=%s",
+                (after, chat_id),
+            )
+            cur.execute(
+                "UPDATE gift_codes SET used_by=%s, used_at=NOW() WHERE code=%s AND used_by IS NULL",
+                (chat_id, code),
+            )
+            if cur.rowcount != 1:
+                return {"ok": False, "reason": "used"}
+
+        tx_code = add_transaction(
+            chat_id,
+            "gift",
+            amount,
+            "completed",
+            "gift-code",
+            {"gift_code": code},
+            before,
+            after,
+            conn=conn,
+        )
+
+    return {
+        "ok": True,
+        "code": code,
+        "amount": amount,
+        "before": before,
+        "after": after,
+        "tx_code": tx_code,
+    }
+
+
 def set_test_balance_with_ledger(chat_id, amount):
     """Admin-only test helper: balance update + ledger entry in one DB transaction."""
     amount = int(amount)
@@ -377,6 +535,9 @@ def referral_stats(chat_id):
 
 
 def db_support_usernames():
+    now = time.monotonic()
+    if now < float(_SUPPORT_CACHE.get("expires", 0)):
+        return list(_SUPPORT_CACHE.get("value") or [])
     names = []
     if db_enabled():
         ensure_db()
@@ -384,21 +545,30 @@ def db_support_usernames():
             with conn.cursor() as cur:
                 cur.execute("SELECT username FROM support_reps WHERE is_active=TRUE ORDER BY sort_order, username")
                 names = [r["username"] for r in cur.fetchall()]
+    _SUPPORT_CACHE["value"] = list(names)
+    _SUPPORT_CACHE["expires"] = now + 5.0
     return names
 
 
-def tg(method, payload=None, timeout=15):
+def tg(method, payload=None, timeout=8):
     if not BOT_TOKEN:
         return {"ok": False, "description": "BOT_TOKEN missing"}
     try:
-        r = requests.post(f"{TG_API}/{method}", json=payload or {}, timeout=timeout)
-        data = r.json()
+        r = TG_SESSION.post(
+            f"{TG_API}/{method}",
+            json=payload or {},
+            timeout=(3.0, float(timeout)),
+        )
+        try:
+            data = r.json()
+        except Exception:
+            data = {"ok": False, "description": f"Telegram HTTP {r.status_code}"}
         if not data.get("ok"):
             print(f"Telegram API error in {method}: {data}", flush=True)
         return data
     except Exception as exc:
         print(f"Telegram API exception in {method}: {exc}", flush=True)
-        return {"ok": False}
+        return {"ok": False, "description": str(exc)}
 
 
 def ensure_native_menu():
@@ -519,24 +689,9 @@ def set_panel(chat_id, text, reply_markup=None, force_new=False):
 
 def show_home(chat_id):
     flows.pop(chat_id, None)
-    ensure_native_menu()
-
-    # Remove any old persistent Reply Keyboard with a separate message.
-    # Important: do NOT try to convert that same message into an Inline Keyboard;
-    # Telegram may treat the text as unchanged and skip the edit.
-    cleanup = send_message(chat_id, "⌨️ تم تحديث القائمة", remove_reply_keyboard())
-
-    # Always send the actual home panel as a fresh message with Inline buttons.
-    panel_message_ids.pop(chat_id, None)
-    res = send_message(chat_id, greeting(chat_id), main_inline_keyboard())
-    if res.get("ok") and res.get("result"):
-        panel_message_ids[chat_id] = res["result"]["message_id"]
-
-    # Keep the chat clean after Telegram has processed the keyboard removal.
-    if cleanup.get("ok") and cleanup.get("result"):
-        delete_message(chat_id, cleanup["result"]["message_id"])
-
-    return res
+    # V12 keeps /start lightweight: one Telegram edit/send only. Native menu is
+    # configured by /set-webhook and does not need two extra API calls per start.
+    return set_panel(chat_id, greeting(chat_id), main_inline_keyboard())
 
 
 def show_account(chat_id, created=False):
@@ -1005,12 +1160,26 @@ def process_text_input(chat_id, text):
 
     if step == "gift_code":
         flows.pop(chat_id, None)
-        set_panel(
-            chat_id,
-            "❌ <b>كود الهدية غير صالح أو غير موجود.</b>\n\n"
-            "سيتم تفعيل إدارة أكواد الهدايا عند بناء لوحة الإدارة.",
-            inline([nav_row("home")])
-        )
+        result = redeem_gift_code(chat_id, text)
+        if result.get("ok"):
+            set_panel(
+                chat_id,
+                "🎉 <b>تم استخدام كود الهدية بنجاح</b>\n\n"
+                f"💰 تمت إضافة: <b>{fmt_amount(result['amount'])}</b>\n"
+                f"💳 رصيدك الحالي: <b>{fmt_amount(result['after'])}</b>\n"
+                f"🧾 <code>{html.escape(result['tx_code'])}</code>",
+                inline([nav_row("home")])
+            )
+            return True
+
+        reason = result.get("reason")
+        if reason == "used":
+            msg = "❌ <b>تم استخدام كود الهدية مسبقًا.</b>"
+        elif reason == "storage_unavailable":
+            msg = "⚠️ <b>الخدمة غير متاحة مؤقتًا.</b>"
+        else:
+            msg = "❌ <b>كود الهدية غير صالح أو غير موجود.</b>"
+        set_panel(chat_id, msg, inline([nav_row("home")]))
         return True
 
     return False
@@ -1047,8 +1216,8 @@ def handle_callback(query):
     if message.get("message_id"):
         panel_message_ids[chat_id] = message["message_id"]
 
+    # Stop Telegram's loading spinner immediately, then render the requested panel.
     answer_callback(callback_id)
-    u = get_user(chat_id)
 
     if data == "home":
         flows.pop(chat_id, None)
@@ -1126,12 +1295,12 @@ def prepare_storage():
 
 @app.route("/")
 def home():
-    return "Asmar Robert Bot UI + PostgreSQL ledger is running ✅"
+    return "Asmar Robert Bot UI + PostgreSQL ledger v12 fast is running ✅"
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory", "ledger": "v10"})
+    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory", "ledger": "v13-gift-codes"})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1143,7 +1312,19 @@ def webhook():
     update = request.get_json(silent=True) or {}
 
     if update.get("callback_query"):
-        handle_callback(update["callback_query"])
+        query = update["callback_query"]
+        started = time.perf_counter()
+        try:
+            handle_callback(query)
+        except Exception as exc:
+            print("Callback error:", repr(exc), flush=True)
+            traceback.print_exc()
+            callback_id = query.get("id")
+            if callback_id:
+                answer_callback(callback_id, "⚠️ حدث خطأ مؤقت، حاول مرة ثانية.", True)
+        finally:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            print(f"callback {query.get('data','')} {elapsed_ms}ms", flush=True)
         return jsonify({"ok": True})
 
     message = update.get("message") or {}
@@ -1213,6 +1394,20 @@ def webhook():
         main_inline_keyboard()
     )
     return jsonify({"ok": True})
+
+
+@app.route("/diagnostics")
+def diagnostics():
+    """Safe operational status: no tokens, passwords, or DB URLs are exposed."""
+    wh = tg("getWebhookInfo", timeout=5)
+    result = wh.get("result") or {} if isinstance(wh, dict) else {}
+    return jsonify({
+        "ok": True,
+        "version": "v13-gift-codes",
+        "db": "postgres" if db_enabled() else "memory",
+        "webhook_pending_updates": result.get("pending_update_count"),
+        "last_webhook_error": result.get("last_error_message"),
+    })
 
 
 @app.route("/set-webhook")
