@@ -8,13 +8,16 @@ import secrets
 import traceback
 import time
 import threading
+from io import BytesIO
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
+
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -25,8 +28,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "0") or 0)
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://asmar-robert-bot.onrender.com"
 ).rstrip("/")
@@ -34,37 +38,25 @@ PUBLIC_BASE_URL = os.environ.get(
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
 
-# Reuse HTTPS connections to Telegram instead of performing a new TLS handshake
-# for every button press. This noticeably improves inline-button latency.
 TG_SESSION = requests.Session()
 TG_ADAPTER = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0)
 TG_SESSION.mount("https://", TG_ADAPTER)
 
 _DB_POOL = None
 _DB_POOL_LOCK = threading.Lock()
-_BONUS_CACHE = {"expires": 0.0, "value": dict()}
+_DB_INITIALIZED = False
+_BONUS_CACHE = {"expires": 0.0, "value": {}}
 _SUPPORT_CACHE = {"expires": 0.0, "value": []}
 
-# -----------------------------------------------------------------------------
-# Persistent storage
-# -----------------------------------------------------------------------------
-# When DATABASE_URL is configured, important user data lives in PostgreSQL.
-# If DATABASE_URL is missing, the bot falls back to temporary in-memory storage
-# so the UI can still be tested safely.
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-
-# Short-lived interface state can stay in RAM. Losing it on a deploy only means
-# the user returns to the main menu; balances/accounts remain in PostgreSQL.
 flows = {}
 panel_message_ids = {}
+panel_message_kinds = {}
 password_visible = {}
 
-# UI-only fallback when no database is connected.
-users = {}
+# UI-only fallback for development without PostgreSQL.
+users_mem = {}
 transactions_mem = []
 bonuses_mem = {}
-_db_initialized = False
-
 
 DEFAULT_BONUSES = {
     "sham": 0,
@@ -73,24 +65,27 @@ DEFAULT_BONUSES = {
     "wish": 0,
 }
 
-# V17 transaction minimums. Funding minimums are in the currency the customer
-# actually sends. Bot/iChancy minimums are in bot-balance units.
+# Transaction minimums agreed for the customer bot.
 MIN_TOPUP_SYP = 20_000
 MIN_TOPUP_USD = Decimal("2")
 MIN_BOT_WITHDRAW = 20_000
 MIN_ICHANCY_DEPOSIT = 20_000
 MIN_ICHANCY_WITHDRAW = 50_000
 
+# Cash-to-bot conversion: 1 SYP sent = 100 bot balance units.
+SYP_TO_BOT_MULTIPLIER = 100
+
+# Sham Cash SYP payment details.
+SHAM_SYP_ACCOUNT_ID = "52b1612cc4685d57d0adb96d4d1be37a"
+SHAM_SYP_ACCOUNT_NAME = "هشام محمد فتوح"
+ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
+SHAM_SYP_QR_PATH = os.path.join(ASSET_DIR, "sham_cash_syp.jpg")
 
 
+# -----------------------------------------------------------------------------
+# Security / DB helpers
+# -----------------------------------------------------------------------------
 def _fernet():
-    """Encrypt recoverable credentials at rest.
-
-    Prefer APP_ENCRYPTION_KEY when configured. For easier testing, we can derive
-    a stable key from BOT_TOKEN. Rotating BOT_TOKEN without setting a dedicated
-    APP_ENCRYPTION_KEY would make old encrypted passwords unreadable, so a
-    dedicated key is recommended before production.
-    """
     raw = os.environ.get("APP_ENCRYPTION_KEY", "").strip()
     if raw:
         try:
@@ -127,10 +122,12 @@ def _get_db_pool():
     with _DB_POOL_LOCK:
         if _DB_POOL is None:
             _DB_POOL = ThreadedConnectionPool(
-                1, 8, DATABASE_URL,
+                1,
+                8,
+                DATABASE_URL,
                 cursor_factory=RealDictCursor,
                 connect_timeout=4,
-                application_name="asmar-robert-customer-bot",
+                application_name="al-asmar-customer-bot",
                 keepalives=1,
                 keepalives_idle=30,
                 keepalives_interval=10,
@@ -141,12 +138,6 @@ def _get_db_pool():
 
 @contextmanager
 def db_conn():
-    """Borrow one PostgreSQL connection and always return it to the pool.
-
-    V11 created a fresh connection on many button presses without explicitly
-    closing it. Over time those connections accumulated and could make callbacks
-    appear frozen. V12 fixes that leak and reuses a small bounded pool.
-    """
     pool = _get_db_pool()
     conn = pool.getconn()
     broken = False
@@ -169,9 +160,10 @@ def db_conn():
 
 
 def ensure_db():
-    global _db_initialized
-    if not db_enabled() or _db_initialized:
+    global _DB_INITIALIZED
+    if not db_enabled() or _DB_INITIALIZED:
         return
+
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -200,7 +192,6 @@ def ensure_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
-            # Safe in-place migration for older V9 databases. No existing data is deleted.
             cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_code TEXT")
             cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS balance_before BIGINT")
             cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS balance_after BIGINT")
@@ -248,16 +239,43 @@ def ensure_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            # Shared with the admin bot. A Sham Cash request created here appears
+            # immediately in the admin bot under top-up requests.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cash_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_code TEXT UNIQUE NOT NULL,
+                    telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    request_type TEXT NOT NULL CHECK (request_type IN ('topup','withdraw')),
+                    amount_bot BIGINT NOT NULL DEFAULT 0,
+                    amount_cash BIGINT NOT NULL DEFAULT 0,
+                    method TEXT,
+                    destination TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cash_requests_type_status
+                ON cash_requests(request_type,status,created_at DESC)
+            """)
+            # The same transfer reference cannot be submitted twice for the same method.
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_requests_topup_method_ref
+                ON cash_requests(method, (details->>'operation_ref'))
+                WHERE request_type='topup' AND details ? 'operation_ref'
+            """)
             for method, percent in DEFAULT_BONUSES.items():
                 cur.execute(
                     "INSERT INTO bonuses(method, percent) VALUES(%s, %s) ON CONFLICT(method) DO NOTHING",
                     (method, percent),
                 )
-    _db_initialized = True
+    _DB_INITIALIZED = True
 
 
 def get_bonuses():
-    """Read current bonus percentages with a tiny cache for fast menus."""
     values = dict(DEFAULT_BONUSES)
     if not db_enabled():
         values.update({k: int(v) for k, v in bonuses_mem.items() if k in values})
@@ -284,8 +302,8 @@ def get_bonuses():
 
 def upsert_user(chat_id, telegram_username=None, first_name=None, referred_by=None):
     if not db_enabled():
-        if chat_id not in users:
-            users[chat_id] = {
+        if chat_id not in users_mem:
+            users_mem[chat_id] = {
                 "balance": 0,
                 "ichancy_username": None,
                 "ichancy_password": None,
@@ -293,6 +311,7 @@ def upsert_user(chat_id, telegram_username=None, first_name=None, referred_by=No
                 "referral_earnings": 0,
             }
         return
+
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -315,11 +334,12 @@ def upsert_user(chat_id, telegram_username=None, first_name=None, referred_by=No
 
 def get_user(chat_id):
     if not db_enabled():
-        if chat_id not in users:
+        if chat_id not in users_mem:
             upsert_user(chat_id)
-        u = dict(users[chat_id])
+        u = dict(users_mem[chat_id])
         u["password_visible"] = password_visible.get(chat_id, False)
         return u
+
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -339,12 +359,12 @@ def get_user(chat_id):
 
 
 def save_ichancy_credentials(chat_id, username, password):
-    """Persist the customer's chosen iChancy credentials."""
     if not db_enabled():
         get_user(chat_id)
-        users[chat_id]["ichancy_username"] = username
-        users[chat_id]["ichancy_password"] = password
+        users_mem[chat_id]["ichancy_username"] = username
+        users_mem[chat_id]["ichancy_password"] = password
         return True, None
+
     ensure_db()
     try:
         with db_conn() as conn:
@@ -360,12 +380,12 @@ def save_ichancy_credentials(chat_id, username, password):
 
 
 def username_taken(username, except_chat_id=None):
-    """Case-insensitive duplicate check before asking for password."""
     if not db_enabled():
-        for cid, u in users.items():
+        for cid, u in users_mem.items():
             if cid != except_chat_id and (u.get("ichancy_username") or "").lower() == username.lower():
                 return True
         return False
+
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -385,20 +405,14 @@ def username_taken(username, except_chat_id=None):
 
 
 def make_tx_code(prefix="TX"):
-    now = datetime.now(timezone.utc)
-    return f"{prefix}-{now.strftime('%y%m%d')}-{secrets.token_hex(4).upper()}"
+    return f"{prefix}-{datetime.now(timezone.utc).strftime('%y%m%d')}-{secrets.token_hex(4).upper()}"
 
 
 def add_transaction(chat_id, tx_type, amount=0, status="completed", method=None, details=None,
-                    balance_before=None, balance_after=None, conn=None):
-    """Write one immutable ledger row and return its public reference code.
-
-    If an existing DB connection is supplied, the insert participates in the same
-    atomic transaction as the balance change. This is the pattern future real
-    deposit/withdraw handlers should use.
-    """
+                    balance_before=None, balance_after=None, conn=None, tx_code=None):
     details = details or {}
-    tx_code = make_tx_code()
+    tx_code = tx_code or make_tx_code()
+
     if not db_enabled():
         transactions_mem.append({
             "telegram_id": chat_id,
@@ -417,134 +431,30 @@ def add_transaction(chat_id, tx_type, amount=0, status="completed", method=None,
     ensure_db()
 
     def _insert(connection):
-        with connection.cursor() as cur:
-            # Extremely unlikely collision, but retry safely if it ever happens.
-            code = tx_code
-            for _ in range(3):
-                try:
+        code = tx_code
+        for _ in range(3):
+            try:
+                with connection.cursor() as cur:
                     cur.execute("""
                         INSERT INTO transactions(
                             telegram_id, tx_code, tx_type, amount, status, method, details,
                             balance_before, balance_after
                         )
-                        VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """, (
                         chat_id, code, tx_type, int(amount), status, method, Json(details),
-                        balance_before, balance_after
+                        balance_before, balance_after,
                     ))
-                    return code
-                except psycopg2.errors.UniqueViolation:
-                    connection.rollback()
-                    code = make_tx_code()
-            raise RuntimeError("could not generate unique transaction code")
+                return code
+            except psycopg2.errors.UniqueViolation:
+                connection.rollback()
+                code = make_tx_code()
+        raise RuntimeError("could not generate unique transaction code")
 
     if conn is not None:
         return _insert(conn)
     with db_conn() as connection:
         return _insert(connection)
-
-
-def redeem_gift_code(chat_id, raw_code):
-    """Redeem one globally single-use gift code atomically.
-
-    The code row is locked while it is checked and consumed, so two users
-    cannot successfully redeem the same code at the same time. The balance
-    credit and ledger entry commit in the same PostgreSQL transaction.
-    """
-    code = (raw_code or "").strip().upper()
-    if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
-        return {"ok": False, "reason": "invalid"}
-
-    if not db_enabled():
-        return {"ok": False, "reason": "storage_unavailable"}
-
-    ensure_db()
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT code, amount, used_by, used_at FROM gift_codes WHERE code=%s FOR UPDATE",
-                (code,),
-            )
-            gift = cur.fetchone()
-            if not gift:
-                return {"ok": False, "reason": "invalid"}
-            if gift["used_by"] is not None:
-                return {"ok": False, "reason": "used"}
-
-            cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (chat_id,))
-            user = cur.fetchone()
-            if not user:
-                raise RuntimeError("user missing")
-
-            amount = int(gift["amount"] or 0)
-            if amount <= 0:
-                return {"ok": False, "reason": "invalid"}
-
-            before = int(user["balance"] or 0)
-            after = before + amount
-            cur.execute(
-                "UPDATE users SET balance=%s, updated_at=NOW() WHERE telegram_id=%s",
-                (after, chat_id),
-            )
-            cur.execute(
-                "UPDATE gift_codes SET used_by=%s, used_at=NOW() WHERE code=%s AND used_by IS NULL",
-                (chat_id, code),
-            )
-            if cur.rowcount != 1:
-                return {"ok": False, "reason": "used"}
-
-        tx_code = add_transaction(
-            chat_id,
-            "gift",
-            amount,
-            "completed",
-            "gift-code",
-            {"gift_code": code},
-            before,
-            after,
-            conn=conn,
-        )
-
-    return {
-        "ok": True,
-        "code": code,
-        "amount": amount,
-        "before": before,
-        "after": after,
-        "tx_code": tx_code,
-    }
-
-
-def set_test_balance_with_ledger(chat_id, amount):
-    """Admin-only test helper: balance update + ledger entry in one DB transaction."""
-    amount = int(amount)
-    if not db_enabled():
-        u = get_user(chat_id)
-        before = int(u.get("balance", 0))
-        users[chat_id]["balance"] = amount
-        code = add_transaction(
-            chat_id, "test_credit", abs(amount - before), "completed", "admin-test",
-            {"note": "UI test balance set"}, before, amount
-        )
-        return before, amount, code
-
-    ensure_db()
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (chat_id,))
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError("user missing")
-            before = int(row["balance"] or 0)
-            cur.execute(
-                "UPDATE users SET balance=%s, updated_at=NOW() WHERE telegram_id=%s",
-                (amount, chat_id),
-            )
-        code = add_transaction(
-            chat_id, "test_credit", abs(amount - before), "completed", "admin-test",
-            {"note": "UI test balance set"}, before, amount, conn=conn
-        )
-    return before, amount, code
 
 
 def list_transactions(chat_id, limit=10, offset=0, tx_types=None):
@@ -553,8 +463,8 @@ def list_transactions(chat_id, limit=10, offset=0, tx_types=None):
         items = [x for x in transactions_mem if x["telegram_id"] == chat_id]
         if tx_types:
             items = [x for x in items if x.get("tx_type") in tx_types]
-        items = items[::-1]
-        return items[int(offset):int(offset) + int(limit)]
+        return items[::-1][int(offset):int(offset) + int(limit)]
+
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -579,10 +489,62 @@ def list_transactions(chat_id, limit=10, offset=0, tx_types=None):
             return list(cur.fetchall())
 
 
+def redeem_gift_code(chat_id, raw_code):
+    code = (raw_code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+        return {"ok": False, "reason": "invalid"}
+    if not db_enabled():
+        return {"ok": False, "reason": "storage_unavailable"}
+
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, amount, used_by FROM gift_codes WHERE code=%s FOR UPDATE",
+                (code,),
+            )
+            gift = cur.fetchone()
+            if not gift:
+                return {"ok": False, "reason": "invalid"}
+            if gift["used_by"] is not None:
+                return {"ok": False, "reason": "used"}
+
+            cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (chat_id,))
+            user = cur.fetchone()
+            if not user:
+                raise RuntimeError("user missing")
+            amount = int(gift["amount"] or 0)
+            before = int(user["balance"] or 0)
+            after = before + amount
+
+            cur.execute("UPDATE users SET balance=%s, updated_at=NOW() WHERE telegram_id=%s", (after, chat_id))
+            cur.execute(
+                "UPDATE gift_codes SET used_by=%s, used_at=NOW() WHERE code=%s AND used_by IS NULL",
+                (chat_id, code),
+            )
+            if cur.rowcount != 1:
+                return {"ok": False, "reason": "used"}
+
+        tx_code = add_transaction(
+            chat_id, "gift", amount, "completed", "gift-code",
+            {"gift_code": code}, before, after, conn=conn,
+        )
+
+    return {
+        "ok": True,
+        "code": code,
+        "amount": amount,
+        "before": before,
+        "after": after,
+        "tx_code": tx_code,
+    }
+
+
 def referral_stats(chat_id):
     if not db_enabled():
-        count = sum(1 for u in users.values() if u.get("referred_by") == chat_id)
+        count = sum(1 for u in users_mem.values() if u.get("referred_by") == chat_id)
         return count, int(get_user(chat_id).get("referral_earnings", 0))
+
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -598,6 +560,7 @@ def db_support_usernames():
     now = time.monotonic()
     if now < float(_SUPPORT_CACHE.get("expires", 0)):
         return list(_SUPPORT_CACHE.get("value") or [])
+
     names = []
     if db_enabled():
         ensure_db()
@@ -610,6 +573,82 @@ def db_support_usernames():
     return names
 
 
+def create_sham_syp_topup_request(chat_id, cash_amount, operation_ref):
+    """Create one pending Sham Cash SYP request for the admin bot.
+
+    No balance is credited here. This only records the customer's transfer claim
+    and expected bot credit. Admin/API verification must complete it later.
+    """
+    if not db_enabled():
+        return {"ok": False, "reason": "storage_unavailable"}
+
+    ensure_db()
+    operation_ref = operation_ref.strip()
+    bonus_percent = int(get_bonuses().get("sham", 0))
+    base_bot = int(cash_amount) * SYP_TO_BOT_MULTIPLIER
+    bonus_amount = (base_bot * bonus_percent) // 100
+    total_bot = base_bot + bonus_amount
+    request_code = make_tx_code("DEP")
+    method = "sham_syp"
+    details = {
+        "operation_ref": operation_ref,
+        "currency": "SYP",
+        "base_bot": base_bot,
+        "bonus_percent": bonus_percent,
+        "bonus_amount": bonus_amount,
+        "account_id": SHAM_SYP_ACCOUNT_ID,
+        "account_name": SHAM_SYP_ACCOUNT_NAME,
+    }
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO cash_requests(
+                        request_code, telegram_id, request_type, amount_bot,
+                        amount_cash, method, destination, status, details
+                    )
+                    VALUES(%s,%s,'topup',%s,%s,%s,%s,'pending',%s)
+                """, (
+                    request_code,
+                    chat_id,
+                    total_bot,
+                    int(cash_amount),
+                    method,
+                    SHAM_SYP_ACCOUNT_ID,
+                    Json(details),
+                ))
+
+            tx_code = add_transaction(
+                chat_id,
+                "bot_topup",
+                total_bot,
+                "pending",
+                method,
+                {**details, "request_code": request_code, "cash_amount": int(cash_amount)},
+                None,
+                None,
+                conn=conn,
+            )
+    except psycopg2.errors.UniqueViolation:
+        return {"ok": False, "reason": "duplicate_ref"}
+
+    return {
+        "ok": True,
+        "request_code": request_code,
+        "tx_code": tx_code,
+        "cash_amount": int(cash_amount),
+        "base_bot": base_bot,
+        "bonus_percent": bonus_percent,
+        "bonus_amount": bonus_amount,
+        "total_bot": total_bot,
+        "operation_ref": operation_ref,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Telegram helpers
+# -----------------------------------------------------------------------------
 def tg(method, payload=None, timeout=4):
     if not BOT_TOKEN:
         return {"ok": False, "description": "BOT_TOKEN missing"}
@@ -632,14 +671,7 @@ def tg(method, payload=None, timeout=4):
 
 
 def ensure_native_menu():
-    """Enable Telegram's native bottom-left Menu button.
-
-    The native menu contains one ready command only: /start — START.
-    """
-    commands = [
-        {"command": "start", "description": "START"},
-    ]
-    tg("setMyCommands", {"commands": commands})
+    tg("setMyCommands", {"commands": [{"command": "start", "description": "START"}]})
     tg("setChatMenuButton", {"menu_button": {"type": "commands"}})
 
 
@@ -679,26 +711,35 @@ def answer_callback(callback_id, text=None, alert=False):
     return tg("answerCallbackQuery", payload, timeout=2.5)
 
 
-def fmt_amount(value):
+def send_photo_file(chat_id, path, caption, reply_markup=None):
+    if not BOT_TOKEN:
+        return {"ok": False, "description": "BOT_TOKEN missing"}
+    if not os.path.exists(path):
+        return {"ok": False, "description": f"photo missing: {os.path.basename(path)}"}
+
+    data = {
+        "chat_id": str(chat_id),
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+
     try:
-        return f"{int(value):,}"
-    except Exception:
-        return "0"
-
-
-def main_inline_keyboard():
-    return inline([
-        [cb("🎮 حساب iChancy 🎮", "account")],
-        [cb("⬇️ شحن رصيد البوت", "topup"), cb("⬆️ سحب رصيد البوت", "withdraw_bot")],
-        [cb("🎮 شحن حساب iChancy", "ichancy_deposit"), cb("💸 سحب من حساب iChancy", "ichancy_withdraw")],
-        [cb("📋 سجل العمليات", "history"), cb("🎁 العروض والبونصات", "offers")],
-        [cb("👥 نظام الإحالات", "referrals"), cb("🎟️ كود الهدية", "gift")],
-        [cb("💬 الدعم والمساعدة", "support"), cb("📜 الشروط والخدمات", "terms")],
-    ])
-
-
-def remove_reply_keyboard():
-    return {"remove_keyboard": True}
+        with open(path, "rb") as photo:
+            r = TG_SESSION.post(
+                f"{TG_API}/sendPhoto",
+                data=data,
+                files={"photo": (os.path.basename(path), photo, "image/jpeg")},
+                timeout=(3.0, 12.0),
+            )
+        result = r.json()
+        if not result.get("ok"):
+            print(f"Telegram API error in sendPhoto: {result}", flush=True)
+        return result
+    except Exception as exc:
+        print(f"Telegram API exception in sendPhoto: {exc}", flush=True)
+        return {"ok": False, "description": str(exc)}
 
 
 def inline(rows):
@@ -710,7 +751,6 @@ def cb(text, data):
 
 
 def nav_row(back_data="home", back_label="🔙 رجوع"):
-    """Single inline back button. Telegram handles the native START button itself."""
     return [cb(back_label, back_data)]
 
 
@@ -719,8 +759,62 @@ def url_btn(text, url):
 
 
 def copy_btn(text, value):
-    # Telegram Bot API supports copy_text buttons.
     return {"text": text, "copy_text": {"text": str(value)}}
+
+
+def fmt_amount(value):
+    try:
+        return f"{int(value):,}"
+    except Exception:
+        return "0"
+
+
+def set_panel(chat_id, text, reply_markup=None, force_new=False):
+    mid = panel_message_ids.get(chat_id)
+    kind = panel_message_kinds.get(chat_id, "text")
+
+    if mid and not force_new and kind == "text":
+        res = edit_message(chat_id, mid, text, reply_markup)
+        if res.get("ok"):
+            return res
+        desc = str(res.get("description", "")).lower()
+        if "message is not modified" in desc:
+            return {"ok": True, "result": {"message_id": mid}}
+
+    # If the active panel was a photo, remove it before switching back to text.
+    if mid and kind == "photo" and not force_new:
+        delete_message(chat_id, mid)
+
+    res = send_message(chat_id, text, reply_markup)
+    if res.get("ok") and res.get("result"):
+        panel_message_ids[chat_id] = res["result"]["message_id"]
+        panel_message_kinds[chat_id] = "text"
+    return res
+
+
+def set_photo_panel(chat_id, path, caption, reply_markup=None):
+    mid = panel_message_ids.get(chat_id)
+    if mid:
+        delete_message(chat_id, mid)
+    res = send_photo_file(chat_id, path, caption, reply_markup)
+    if res.get("ok") and res.get("result"):
+        panel_message_ids[chat_id] = res["result"]["message_id"]
+        panel_message_kinds[chat_id] = "photo"
+    return res
+
+
+# -----------------------------------------------------------------------------
+# Customer UI
+# -----------------------------------------------------------------------------
+def main_inline_keyboard():
+    return inline([
+        [cb("🎮 حساب iChancy 🎮", "account")],
+        [cb("⬇️ شحن رصيد البوت", "topup"), cb("⬆️ سحب رصيد البوت", "withdraw_bot")],
+        [cb("🎮 شحن حساب iChancy", "ichancy_deposit"), cb("💸 سحب من حساب iChancy", "ichancy_withdraw")],
+        [cb("📋 سجل العمليات", "history"), cb("🎁 العروض والبونصات", "offers")],
+        [cb("👥 نظام الإحالات", "referrals"), cb("🎟️ كود الهدية", "gift")],
+        [cb("💬 الدعم والمساعدة", "support"), cb("📜 الشروط والخدمات", "terms")],
+    ])
 
 
 def greeting(chat_id):
@@ -733,48 +827,20 @@ def greeting(chat_id):
     )
 
 
-def set_panel(chat_id, text, reply_markup=None, force_new=False):
-    """Edit the current bot panel when possible; otherwise send a new one."""
-    mid = panel_message_ids.get(chat_id)
-    if mid and not force_new:
-        res = edit_message(chat_id, mid, text, reply_markup)
-        if res.get("ok"):
-            return res
-        desc = str(res.get("description", "")).lower()
-        if "message is not modified" in desc:
-            return {"ok": True, "result": {"message_id": mid}}
-
-    res = send_message(chat_id, text, reply_markup)
-    if res.get("ok") and res.get("result"):
-        panel_message_ids[chat_id] = res["result"]["message_id"]
-    return res
-
-
 def show_home(chat_id, force_new=False):
     flows.pop(chat_id, None)
-    # /start can force a fresh message below the command. Inline navigation still
-    # edits the active panel to keep normal browsing clean and fast.
-    return set_panel(
-        chat_id,
-        greeting(chat_id),
-        main_inline_keyboard(),
-        force_new=force_new,
-    )
+    return set_panel(chat_id, greeting(chat_id), main_inline_keyboard(), force_new=force_new)
 
 
 def show_account(chat_id, created=False):
     u = get_user(chat_id)
     flows.pop(chat_id, None)
     if not u["ichancy_username"]:
-        text = (
-            "🎮 <b>حساب iChancy</b> 🎮\n\n"
-            "لا يوجد حساب iChancy مرتبط بحسابك حاليًا."
+        return set_panel(
+            chat_id,
+            "🎮 <b>حساب iChancy</b> 🎮\n\nلا يوجد حساب iChancy مرتبط بحسابك حاليًا.",
+            inline([[cb("➕ إنشاء حساب جديد", "ichancy_create")], nav_row("home")]),
         )
-        markup = inline([
-            [cb("➕ إنشاء حساب جديد", "ichancy_create")],
-            nav_row("home"),
-        ])
-        return set_panel(chat_id, text, markup)
 
     pwd = u["ichancy_password"] or ""
     shown = html.escape(pwd) if u.get("password_visible") else "••••••••"
@@ -785,15 +851,14 @@ def show_account(chat_id, created=False):
         f"👤 اسم المستخدم: <code>{username}</code>\n"
         f"🔑 كلمة المرور: <code>{shown}</code>"
     )
-    toggle_label = "🙈 إخفاء كلمة المرور" if u.get("password_visible") else "👁 عرض كلمة المرور"
-    markup = inline([
+    toggle = "🙈 إخفاء كلمة المرور" if u.get("password_visible") else "👁 عرض كلمة المرور"
+    return set_panel(chat_id, text, inline([
         [copy_btn("📋 نسخ اسم المستخدم", u["ichancy_username"])],
-        [cb(toggle_label, "ichancy_toggle_password")],
+        [cb(toggle, "ichancy_toggle_password")],
         [copy_btn("📋 نسخ كلمة المرور", pwd)],
         [url_btn("🌐 الدخول إلى iChancy", "https://www.ichancy200.com")],
         nav_row("home"),
-    ])
-    return set_panel(chat_id, text, markup)
+    ]))
 
 
 def show_topup(chat_id):
@@ -804,44 +869,67 @@ def show_topup(chat_id):
         f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n\n"
         "🎁 <b>البونصات المتاحة حاليًا</b>\n"
         f"💸 Sham Cash: <b>+{b['sham']}%</b>\n"
-        f"🔴 سيريتيل كاش: <b>+{b['syriatel']}%</b>\n"
+        f"🔴 Syriatel Cash: <b>+{b['syriatel']}%</b>\n"
         f"🟢 USDT: <b>+{b['usdt']}%</b>\n"
         f"🟣 Wish Money: <b>+{b['wish']}%</b>\n\n"
         "اختر وسيلة الشحن المناسبة:"
     )
-    markup = inline([
+    return set_panel(chat_id, text, inline([
         [cb("💸 Sham Cash", "topup_sham"), cb("🔴 Syriatel Cash", "topup_syriatel")],
         [cb("🟢 USDT", "topup_usdt"), cb("🟣 Wish Money", "topup_wish")],
         nav_row("home"),
-    ])
-    return set_panel(chat_id, text, markup)
+    ]))
 
 
 def show_sham_cash_currency(chat_id):
-    text = (
-        "💸 <b>Sham Cash</b>\n\n"
-        "اختر العملة التي تريد الإيداع بها:"
+    return set_panel(
+        chat_id,
+        "💸 <b>Sham Cash</b>\n\nاختر العملة التي تريد الإيداع بها:",
+        inline([
+            [cb("💸 Sham Cash ليرة", "topup_sham_syp")],
+            [cb("💲 Sham Cash Dollar", "topup_sham_usd")],
+            nav_row("topup"),
+        ]),
+    )
+
+
+def show_sham_syp_payment(chat_id):
+    b = get_bonuses()
+    bonus = int(b.get("sham", 0))
+    caption = (
+        "💸 <b>Sham Cash ليرة</b>\n\n"
+        f"👤 اسم الحساب: <b>{html.escape(SHAM_SYP_ACCOUNT_NAME)}</b>\n"
+        f"🆔 معرف الحساب:\n<code>{SHAM_SYP_ACCOUNT_ID}</code>\n\n"
+        f"🔻 الحد الأدنى للإيداع: <b>{fmt_amount(MIN_TOPUP_SYP)} ل.س</b>\n"
+        f"🎁 البونص الحالي: <b>+{bonus}%</b>\n\n"
+        "حوّل المبلغ إلى الحساب الظاهر بالصورة، وبعد إتمام التحويل اضغط <b>تم التحويل</b>."
     )
     markup = inline([
-        [cb("💸 Sham Cash ليرة", "topup_sham_syp")],
-        [cb("💲 Sham Cash Dollar", "topup_sham_usd")],
-        nav_row("topup"),
+        [copy_btn("📋 نسخ معرف Sham Cash", SHAM_SYP_ACCOUNT_ID)],
+        [cb("✅ تم التحويل", "sham_syp_done")],
+        nav_row("topup_sham"),
     ])
-    return set_panel(chat_id, text, markup)
+    res = set_photo_panel(chat_id, SHAM_SYP_QR_PATH, caption, markup)
+    if not res.get("ok"):
+        # Safe fallback if the image file was forgotten during upload.
+        fallback = (
+            caption
+            + "\n\n⚠️ <i>صورة QR غير موجودة على السيرفر، استخدم معرف الحساب أعلاه.</i>"
+        )
+        return set_panel(chat_id, fallback, markup)
+    return res
 
 
 def show_usdt_networks(chat_id):
-    text = (
+    return set_panel(chat_id, (
         "🟢 <b>الشحن عبر USDT</b>\n\n"
         "💵 الحد الأدنى للإيداع: <b>$2</b>\n\n"
         "اختر شبكة التحويل:"
-    )
-    markup = inline([
+    ), inline([
         [cb("🔴 USDT TRC20", "usdt_trc20")],
         [cb("🟡 USDT BEP20", "usdt_bep20")],
         nav_row("topup"),
-    ])
-    return set_panel(chat_id, text, markup)
+    ]))
 
 
 def show_topup_amount_prompt(chat_id, method_name, currency, minimum, back_data="topup"):
@@ -858,118 +946,99 @@ def show_topup_amount_prompt(chat_id, method_name, currency, minimum, back_data=
     else:
         minimum_text = f"${minimum}"
         prompt = "أدخل مبلغ الإيداع بالدولار."
-    text = (
+    return set_panel(chat_id, (
         f"💳 <b>{html.escape(method_name)}</b>\n\n"
         f"🔻 الحد الأدنى للإيداع: <b>{minimum_text}</b>\n\n"
         f"{prompt}"
-    )
-    return set_panel(chat_id, text, inline([nav_row(back_data, "🔙 إلغاء")]))
+    ), inline([nav_row(back_data, "🔙 إلغاء")]))
 
 
 def show_topup_ready(chat_id, method_name, currency, amount):
-    # Temporary final screen until the payment API + image/instructions are wired.
-    if currency == "SYP":
-        amount_text = f"{fmt_amount(int(amount))} ل.س"
-    else:
-        amount_text = f"${format(amount, 'f').rstrip('0').rstrip('.')}"
-    text = (
+    amount_text = (
+        f"{fmt_amount(int(amount))} ل.س"
+        if currency == "SYP"
+        else f"${format(amount, 'f').rstrip('0').rstrip('.')}"
+    )
+    return set_panel(chat_id, (
         "✅ <b>تم قبول المبلغ</b>\n\n"
         f"💳 الطريقة: <b>{html.escape(method_name)}</b>\n"
         f"💰 المبلغ: <b>{amount_text}</b>\n\n"
-        "🚧 سيتم إضافة صورة وتعليمات التحويل والتحقق التلقائي لهذه الطريقة لاحقًا."
-    )
-    return set_panel(chat_id, text, inline([nav_row("topup")]))
+        "🚧 سيتم إضافة صورة وتعليمات التحويل لهذه الطريقة لاحقًا."
+    ), inline([nav_row("topup")]))
 
 
 def show_withdraw_bot(chat_id):
     u = get_user(chat_id)
-    text = (
+    return set_panel(chat_id, (
         "💸 <b>سحب رصيد البوت</b>\n\n"
         f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n\n"
         "اختر طريقة السحب المناسبة:"
-    )
-    markup = inline([
-        [cb("🟩 شام كاش", "wd_sham"), cb("🔴 سيريتيل كاش", "wd_syriatel")],
+    ), inline([
+        [cb("💸 Sham Cash", "wd_sham"), cb("🔴 Syriatel Cash", "wd_syriatel")],
         [cb("🟢 USDT", "wd_usdt"), cb("🟣 Wish Money", "wd_wish")],
         nav_row("home"),
-    ])
-    return set_panel(chat_id, text, markup)
+    ]))
 
 
 def show_withdraw_method(chat_id, method_name):
     u = get_user(chat_id)
     flows[chat_id] = {"step": "withdraw_bot_amount", "method": method_name}
-    text = (
+    return set_panel(chat_id, (
         f"💸 <b>السحب عبر {html.escape(method_name)}</b>\n\n"
         f"💰 رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n"
         f"🔻 الحد الأدنى للسحب: <b>{fmt_amount(MIN_BOT_WITHDRAW)}</b>\n\n"
         "أدخل المبلغ المطلوب سحبه من رصيد البوت."
-    )
-    return set_panel(chat_id, text, inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
+    ), inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
 
 
 def show_ichancy_deposit(chat_id):
     u = get_user(chat_id)
     if not u["ichancy_username"]:
-        text = (
+        return set_panel(chat_id, (
             "⚠️ <b>لا يوجد حساب iChancy مرتبط بحسابك.</b>\n\n"
             "أنشئ حساب iChancy أولًا للمتابعة."
-        )
-        return set_panel(chat_id, text, inline([
-            [cb("🎮 إنشاء حساب iChancy", "ichancy_create")],
-            nav_row("home"),
-        ]))
+        ), inline([[cb("🎮 إنشاء حساب iChancy", "ichancy_create")], nav_row("home")]))
     flows[chat_id] = {"step": "ichancy_deposit_amount"}
-    text = (
+    return set_panel(chat_id, (
         "🎮 <b>شحن حساب iChancy</b>\n\n"
         f"💰 رصيدك المتاح: <b>{fmt_amount(u['balance'])}</b>\n"
         f"🔻 الحد الأدنى للشحن: <b>{fmt_amount(MIN_ICHANCY_DEPOSIT)}</b>\n\n"
         "أدخل المبلغ الذي ترغب بإضافته إلى حسابك."
-    )
-    return set_panel(chat_id, text, inline([nav_row("home", "🔙 إلغاء")]))
+    ), inline([nav_row("home", "🔙 إلغاء")]))
 
 
 def show_ichancy_withdraw(chat_id):
     u = get_user(chat_id)
     if not u["ichancy_username"]:
-        text = (
+        return set_panel(chat_id, (
             "⚠️ <b>لا يوجد حساب iChancy مرتبط بحسابك.</b>\n\n"
             "أنشئ حساب iChancy أولًا للمتابعة."
-        )
-        return set_panel(chat_id, text, inline([
-            [cb("🎮 إنشاء حساب iChancy", "ichancy_create")],
-            nav_row("home"),
-        ]))
-    # Bridge is not connected in this UI prototype yet.
-    text = (
+        ), inline([[cb("🎮 إنشاء حساب iChancy", "ichancy_create")], nav_row("home")]))
+    return set_panel(chat_id, (
         "⚠️ <b>الخدمة غير متاحة مؤقتًا</b>\n\n"
         f"🔻 الحد الأدنى للسحب من iChancy: <b>{fmt_amount(MIN_ICHANCY_WITHDRAW)}</b>\n\n"
         "يرجى المحاولة بعد قليل."
-    )
-    return set_panel(chat_id, text, inline([nav_row("home")]))
+    ), inline([nav_row("home")]))
 
 
 def show_history(chat_id):
-    text = "📋 <b>سجل العمليات</b>\n\nاختر نوع العمليات:"
-    markup = inline([
+    return set_panel(chat_id, "📋 <b>سجل العمليات</b>\n\nاختر نوع العمليات:", inline([
         [cb("⬇️ شحن رصيد البوت", "history:bot_topup:0")],
         [cb("⬆️ سحب رصيد البوت", "history:bot_withdraw:0")],
         [cb("🎮 شحن iChancy", "history:ichancy_deposit:0")],
         [cb("↩️ سحب من iChancy", "history:ichancy_withdraw:0")],
         [cb("📋 جميع العمليات", "history:all:0")],
         nav_row("home"),
-    ])
-    return set_panel(chat_id, text, markup)
+    ]))
 
 
 def _history_types(filter_name):
-    mapping = {
+    return {
         "bot_topup": ["bot_topup"],
         "bot_withdraw": ["bot_withdraw"],
         "ichancy_deposit": ["ichancy_deposit"],
         "ichancy_withdraw": ["ichancy_withdraw"],
-    }
-    return mapping.get(filter_name, [])
+    }.get(filter_name, [])
 
 
 def _history_title(filter_name):
@@ -1003,20 +1072,13 @@ def _amount_prefix(item):
         return "+"
     if tx_type in {"bot_withdraw", "ichancy_deposit"}:
         return "-"
-    if tx_type == "test_credit":
-        before = item.get("balance_before")
-        after = item.get("balance_after")
-        if before is not None and after is not None:
-            return "+" if int(after) >= int(before) else "-"
     return ""
 
 
 def show_history_page(chat_id, filter_name="all", page=0):
     page = max(0, int(page))
     per_page = 10
-    types = _history_types(filter_name)
-    # Fetch one extra row only to know whether a Next button is needed.
-    items = list_transactions(chat_id, per_page + 1, page * per_page, types)
+    items = list_transactions(chat_id, per_page + 1, page * per_page, _history_types(filter_name))
     has_next = len(items) > per_page
     items = items[:per_page]
 
@@ -1029,7 +1091,7 @@ def show_history_page(chat_id, filter_name="all", page=0):
         "gift": "🎟️ كود هدية",
         "referral": "👥 مكافأة إحالة",
     }
-    status_labels = {
+    statuses = {
         "completed": "✅ مكتملة",
         "pending": "⏳ قيد المعالجة",
         "approved": "🟡 مقبولة",
@@ -1038,17 +1100,16 @@ def show_history_page(chat_id, filter_name="all", page=0):
         "failed": "❌ فشلت",
     }
 
-    lines = [f"{_history_title(filter_name)}", ""]
+    lines = [_history_title(filter_name), ""]
     if not items:
         lines.append("لا توجد عمليات مسجلة.")
     else:
         for idx, item in enumerate(items):
             lines.append(labels.get(item.get("tx_type"), "🧾 عملية"))
-            prefix = _amount_prefix(item)
-            lines.append(f"💰 <b>{prefix}{fmt_amount(item.get('amount', 0))}</b>")
+            lines.append(f"💰 <b>{_amount_prefix(item)}{fmt_amount(item.get('amount', 0))}</b>")
             if item.get("method"):
                 lines.append(f"💳 {html.escape(str(item['method']))}")
-            lines.append(status_labels.get(item.get("status"), html.escape(str(item.get("status", "")))))
+            lines.append(statuses.get(item.get("status"), html.escape(str(item.get("status", "")))))
             if item.get("tx_code"):
                 lines.append(f"🧾 <code>{html.escape(str(item['tx_code']))}</code>")
             lines.append(f"🕒 {_local_time(item.get('created_at'))}")
@@ -1070,45 +1131,36 @@ def show_history_page(chat_id, filter_name="all", page=0):
 
 def show_offers(chat_id):
     b = get_bonuses()
-    text = (
+    return set_panel(chat_id, (
         "🎁 <b>العروض والبونصات الحالية</b>\n\n"
         f"💸 Sham Cash: <b>+{b['sham']}%</b>\n"
-        f"🔴 سيريتيل كاش: <b>+{b['syriatel']}%</b>\n"
+        f"🔴 Syriatel Cash: <b>+{b['syriatel']}%</b>\n"
         f"🟢 USDT: <b>+{b['usdt']}%</b>\n"
         f"🟣 Wish Money: <b>+{b['wish']}%</b>\n\n"
         "استفد من البونص عند شحن رصيد البوت عبر الوسيلة التي عليها عرض."
-    )
-    return set_panel(chat_id, text, inline([
-        [cb("⬇️ شحن رصيد البوت", "topup")],
-        nav_row("home"),
-    ]))
+    ), inline([[cb("⬇️ شحن رصيد البوت", "topup")], nav_row("home")]))
 
 
 def show_referrals(chat_id, bot_username=None):
     bot_username = bot_username or os.environ.get("BOT_USERNAME", "YourBot")
     link = f"https://t.me/{bot_username}?start=ref_{chat_id}"
-    ref_count, ref_earnings = referral_stats(chat_id)
-    text = (
+    count, earnings = referral_stats(chat_id)
+    return set_panel(chat_id, (
         "👥 <b>نظام الإحالات</b>\n\n"
         "شارك رابطك الخاص وادعُ أصدقاءك للانضمام إلى البوت.\n\n"
-        f"👤 عدد الأشخاص المسجلين عن طريقك: <b>{ref_count}</b>\n"
-        f"💰 أرباح الإحالات: <b>{fmt_amount(ref_earnings)}</b>\n\n"
+        f"👤 عدد الأشخاص المسجلين عن طريقك: <b>{count}</b>\n"
+        f"💰 أرباح الإحالات: <b>{fmt_amount(earnings)}</b>\n\n"
         f"🔗 رابط الإحالة الخاص بك:\n<code>{html.escape(link)}</code>"
-    )
-    return set_panel(chat_id, text, inline([
-        [copy_btn("📋 نسخ رابط الإحالة", link)],
-        nav_row("home"),
-    ]))
+    ), inline([[copy_btn("📋 نسخ رابط الإحالة", link)], nav_row("home")]))
 
 
 def show_gift(chat_id):
     flows[chat_id] = {"step": "gift_code"}
-    text = (
+    return set_panel(chat_id, (
         "🎟️ <b>كود الهدية</b>\n\n"
         "أدخل كود الهدية للاستفادة من المكافأة.\n\n"
         "كل كود صالح لاستخدام واحد فقط على مستوى البوت بالكامل."
-    )
-    return set_panel(chat_id, text, inline([nav_row("home", "🔙 إلغاء")]))
+    ), inline([nav_row("home", "🔙 إلغاء")]))
 
 
 def support_usernames():
@@ -1116,12 +1168,11 @@ def support_usernames():
     if result:
         return result
     raw = os.environ.get("SUPPORT_USERNAMES", "")
-    result = []
-    for x in raw.split(","):
-        x = x.strip().lstrip("@")
-        if x and re.fullmatch(r"[A-Za-z0-9_]{5,32}", x):
-            result.append(x)
-    return result
+    return [
+        x.strip().lstrip("@")
+        for x in raw.split(",")
+        if re.fullmatch(r"[A-Za-z0-9_]{5,32}", x.strip().lstrip("@"))
+    ]
 
 
 def show_support(chat_id):
@@ -1138,7 +1189,7 @@ def show_support(chat_id):
 
 
 def show_terms(chat_id):
-    text = (
+    return set_panel(chat_id, (
         "📜 <b>الشروط والخدمات</b>\n\n"
         "يُرجى قراءة الشروط بعناية قبل استخدام الخدمات.\n\n"
         "• تأكد من صحة بيانات حساب iChancy قبل تنفيذ أي عملية.\n"
@@ -1148,27 +1199,12 @@ def show_terms(chat_id):
         "• يحق للإدارة مراجعة أي عملية مشبوهة لحماية الحسابات والأرصدة.\n"
         "• نسب البونص والعروض قابلة للتغيير وتظهر داخل قسم شحن رصيد البوت.\n\n"
         "👑 شكرًا لثقتكم بخدماتنا"
-    )
-    return set_panel(chat_id, text, inline([nav_row("home")]))
+    ), inline([nav_row("home")]))
 
 
-def ichancy_create_rejection_message(reason):
-    """Map future iChancy/bridge create-account rejections to customer-safe text.
-
-    The current UI prototype does not call the cashier yet. Once the Android
-    bridge is connected, username-conflict responses should route back to the
-    username step using this message.
-    """
-    normalized = str(reason or "").strip().lower()
-    username_conflicts = {
-        "username_exists", "username_taken", "duplicate_username",
-        "user_exists", "login_exists", "already_exists",
-    }
-    if normalized in username_conflicts:
-        return "❌ اسم المستخدم مستخدم من قبل، اختر اسمًا آخر."
-    return "⚠️ تعذر إنشاء الحساب حاليًا، حاول مرة ثانية."
-
-
+# -----------------------------------------------------------------------------
+# Text-flow handlers
+# -----------------------------------------------------------------------------
 def parse_amount(text):
     cleaned = text.replace(",", "").replace(" ", "").strip()
     if not cleaned.isdigit():
@@ -1199,59 +1235,88 @@ def process_text_input(chat_id, text):
     if step == "ichancy_username":
         candidate = text.strip()
         if not re.fullmatch(r"[A-Za-z0-9_]{4,24}", candidate):
-            set_panel(
-                chat_id,
-                "👤 <b>اكتب اسم المستخدم</b>\n\n"
-                "اسم المستخدم غير صالح.",
-                inline([nav_row("account", "🔙 إلغاء")])
-            )
+            set_panel(chat_id, "👤 <b>اكتب اسم المستخدم</b>\n\nاسم المستخدم غير صالح.", inline([nav_row("account", "🔙 إلغاء")]))
             return True
         if username_taken(candidate, chat_id):
-            set_panel(
-                chat_id,
-                "👤 <b>اكتب اسم المستخدم</b>\n\n❌ اسم المستخدم مستخدم من قبل، اختر اسمًا آخر.",
-                inline([nav_row("account", "🔙 إلغاء")])
-            )
+            set_panel(chat_id, "👤 <b>اكتب اسم المستخدم</b>\n\n❌ اسم المستخدم مستخدم من قبل، اختر اسمًا آخر.", inline([nav_row("account", "🔙 إلغاء")]))
             return True
         flow["username"] = candidate
         flow["step"] = "ichancy_password"
-        set_panel(
-            chat_id,
-            "🔐 <b>اكتب كلمة المرور</b>",
-            inline([nav_row("account", "🔙 إلغاء")])
-        )
+        set_panel(chat_id, "🔐 <b>اكتب كلمة المرور</b>", inline([nav_row("account", "🔙 إلغاء")]))
         return True
 
     if step == "ichancy_password":
         password = text.strip()
         if len(password) < 6 or len(password) > 64:
-            set_panel(
-                chat_id,
-                "🔐 <b>اكتب كلمة المرور</b>\n\n"
-                "كلمة المرور قصيرة جدًا.",
-                inline([nav_row("account", "🔙 إلغاء")])
-            )
+            set_panel(chat_id, "🔐 <b>اكتب كلمة المرور</b>\n\nكلمة المرور قصيرة جدًا.", inline([nav_row("account", "🔙 إلغاء")]))
             return True
-        # UI prototype only: save in our persistent DB. No real iChancy request is sent yet.
         ok, reason = save_ichancy_credentials(chat_id, flow["username"], password)
         if not ok:
             flow["step"] = "ichancy_username"
-            set_panel(
-                chat_id,
-                "👤 <b>اكتب اسم المستخدم</b>\n\n❌ اسم المستخدم مستخدم من قبل، اختر اسمًا آخر.",
-                inline([nav_row("account", "🔙 إلغاء")])
-            )
+            set_panel(chat_id, "👤 <b>اكتب اسم المستخدم</b>\n\n❌ اسم المستخدم مستخدم من قبل، اختر اسمًا آخر.", inline([nav_row("account", "🔙 إلغاء")]))
             return True
         password_visible[chat_id] = False
         flows.pop(chat_id, None)
         show_account(chat_id, created=True)
         return True
 
+    if step == "sham_syp_amount":
+        amount = parse_amount(text)
+        if amount is None:
+            set_panel(chat_id, "⚠️ أدخل المبلغ بالأرقام فقط.", inline([nav_row("topup_sham_syp", "🔙 إلغاء")]))
+            return True
+        if amount < MIN_TOPUP_SYP:
+            set_panel(chat_id, (
+                f"❌ <b>الحد الأدنى للإيداع هو {fmt_amount(MIN_TOPUP_SYP)} ل.س</b>\n\n"
+                "أدخل مبلغًا أعلى."
+            ), inline([nav_row("topup_sham_syp", "🔙 إلغاء")]))
+            return True
+        flow["cash_amount"] = amount
+        flow["step"] = "sham_syp_reference"
+        set_panel(chat_id, (
+            "🧾 <b>اكتب رقم العملية</b>\n\n"
+            f"💰 المبلغ: <b>{fmt_amount(amount)} ل.س</b>\n\n"
+            "الصق رقم العملية / المرجع الموجود في Sham Cash بعد التحويل."
+        ), inline([nav_row("topup_sham_syp", "🔙 إلغاء")]))
+        return True
+
+    if step == "sham_syp_reference":
+        operation_ref = text.strip()
+        if len(operation_ref) < 3 or len(operation_ref) > 120:
+            set_panel(chat_id, "⚠️ رقم العملية غير صالح. أرسله كما يظهر في Sham Cash.", inline([nav_row("topup_sham_syp", "🔙 إلغاء")]))
+            return True
+
+        result = create_sham_syp_topup_request(chat_id, flow["cash_amount"], operation_ref)
+        if not result.get("ok"):
+            if result.get("reason") == "duplicate_ref":
+                msg = "❌ <b>رقم العملية مستخدم مسبقًا.</b>\n\nتأكد من رقم العملية وحاول مرة ثانية."
+            else:
+                msg = "⚠️ <b>تعذر حفظ طلب الإيداع حاليًا.</b>\n\nحاول مرة ثانية بعد قليل."
+            set_panel(chat_id, msg, inline([nav_row("topup_sham_syp")]))
+            return True
+
+        flows.pop(chat_id, None)
+        bonus_line = ""
+        if result["bonus_percent"] > 0:
+            bonus_line = (
+                f"🎁 البونص: <b>+{result['bonus_percent']}%</b> "
+                f"({fmt_amount(result['bonus_amount'])})\n"
+            )
+        set_panel(chat_id, (
+            "✅ <b>تم استلام طلب الإيداع</b>\n\n"
+            f"💵 المبلغ المحول: <b>{fmt_amount(result['cash_amount'])} ل.س</b>\n"
+            f"💰 الرصيد الأساسي: <b>{fmt_amount(result['base_bot'])}</b>\n"
+            f"{bonus_line}"
+            f"💳 الرصيد المتوقع بعد التحقق: <b>{fmt_amount(result['total_bot'])}</b>\n"
+            f"🧾 رقم الطلب: <code>{html.escape(result['request_code'])}</code>\n\n"
+            "⏳ طلبك قيد المراجعة. سيتم إضافة الرصيد بعد التحقق من الحوالة."
+        ), inline([nav_row("home")]))
+        return True
+
     if step == "bot_topup_amount":
         currency = flow.get("currency")
         method = flow.get("method", "غير محدد")
         back_data = flow.get("back_data", "topup")
-
         if currency == "SYP":
             amount = parse_amount(text)
             minimum = int(Decimal(flow.get("minimum", str(MIN_TOPUP_SYP))))
@@ -1259,11 +1324,7 @@ def process_text_input(chat_id, text):
                 set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row(back_data, "🔙 إلغاء")]))
                 return True
             if amount < minimum:
-                set_panel(
-                    chat_id,
-                    f"❌ <b>الحد الأدنى للإيداع هو {fmt_amount(minimum)} ل.س</b>\n\nأدخل مبلغًا أعلى.",
-                    inline([nav_row(back_data, "🔙 إلغاء")])
-                )
+                set_panel(chat_id, f"❌ <b>الحد الأدنى للإيداع هو {fmt_amount(minimum)} ل.س</b>\n\nأدخل مبلغًا أعلى.", inline([nav_row(back_data, "🔙 إلغاء")]))
                 return True
             flows.pop(chat_id, None)
             show_topup_ready(chat_id, method, currency, Decimal(amount))
@@ -1272,18 +1333,10 @@ def process_text_input(chat_id, text):
         amount = parse_decimal_amount(text)
         minimum = Decimal(flow.get("minimum", str(MIN_TOPUP_USD)))
         if amount is None:
-            set_panel(
-                chat_id,
-                "⚠️ أدخل مبلغًا صحيحًا، مثال: <code>2</code> أو <code>2.5</code>.",
-                inline([nav_row(back_data, "🔙 إلغاء")])
-            )
+            set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا، مثال: <code>2</code> أو <code>2.5</code>.", inline([nav_row(back_data, "🔙 إلغاء")]))
             return True
         if amount < minimum:
-            set_panel(
-                chat_id,
-                f"❌ <b>الحد الأدنى للإيداع هو ${minimum}</b>\n\nأدخل مبلغًا أعلى.",
-                inline([nav_row(back_data, "🔙 إلغاء")])
-            )
+            set_panel(chat_id, f"❌ <b>الحد الأدنى للإيداع هو ${minimum}</b>\n\nأدخل مبلغًا أعلى.", inline([nav_row(back_data, "🔙 إلغاء")]))
             return True
         flows.pop(chat_id, None)
         show_topup_ready(chat_id, method, currency, amount)
@@ -1295,34 +1348,24 @@ def process_text_input(chat_id, text):
             set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
             return True
         if amount < MIN_BOT_WITHDRAW:
-            set_panel(
-                chat_id,
-                f"❌ <b>الحد الأدنى للسحب هو {fmt_amount(MIN_BOT_WITHDRAW)}</b>\n\nأدخل مبلغًا أعلى.",
-                inline([nav_row("withdraw_bot", "🔙 إلغاء")])
-            )
+            set_panel(chat_id, f"❌ <b>الحد الأدنى للسحب هو {fmt_amount(MIN_BOT_WITHDRAW)}</b>\n\nأدخل مبلغًا أعلى.", inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
             return True
         if amount > u["balance"]:
-            set_panel(
-                chat_id,
+            flows.pop(chat_id, None)
+            set_panel(chat_id, (
                 "⚠️ <b>الرصيد غير كافٍ</b>\n\n"
                 f"رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n"
-                f"المبلغ المطلوب: <b>{fmt_amount(amount)}</b>",
-                inline([[cb("🔙 رجوع", "withdraw_bot")]])
-            )
-            flows.pop(chat_id, None)
+                f"المبلغ المطلوب: <b>{fmt_amount(amount)}</b>"
+            ), inline([nav_row("withdraw_bot")]))
             return True
         method = flow.get("method", "غير محدد")
         flows.pop(chat_id, None)
-        # No real balance mutation in the UI-only prototype.
-        text2 = (
+        set_panel(chat_id, (
             "✅ <b>تم استلام طلب السحب</b>\n\n"
             f"💰 المبلغ: <b>{fmt_amount(amount)}</b>\n"
             f"💳 طريقة الاستلام: <b>{html.escape(method)}</b>\n\n"
-            "⏱️ سيتم تنفيذ طلبك بأسرع وقت ممكن، وعادةً خلال مدة تتراوح بين ساعة و3 ساعات.\n"
-            "سيتم إشعارك فور اكتمال الحوالة. 👑\n\n"
-            "🧪 <i>طلب تجريبي فقط، لم يتم خصم أو تحويل أي رصيد.</i>"
-        )
-        set_panel(chat_id, text2, inline([nav_row("home")]))
+            "⏱️ سيتم تنفيذ طلبك بأسرع وقت ممكن، وعادةً خلال مدة تتراوح بين ساعة و3 ساعات."
+        ), inline([nav_row("home")]))
         return True
 
     if step == "ichancy_deposit_amount":
@@ -1331,44 +1374,30 @@ def process_text_input(chat_id, text):
             set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row("home", "🔙 إلغاء")]))
             return True
         if amount < MIN_ICHANCY_DEPOSIT:
-            set_panel(
-                chat_id,
-                f"❌ <b>الحد الأدنى لشحن iChancy هو {fmt_amount(MIN_ICHANCY_DEPOSIT)}</b>\n\nأدخل مبلغًا أعلى.",
-                inline([nav_row("home", "🔙 إلغاء")])
-            )
+            set_panel(chat_id, f"❌ <b>الحد الأدنى لشحن iChancy هو {fmt_amount(MIN_ICHANCY_DEPOSIT)}</b>\n\nأدخل مبلغًا أعلى.", inline([nav_row("home", "🔙 إلغاء")]))
             return True
         flows.pop(chat_id, None)
         if amount > u["balance"]:
-            set_panel(
-                chat_id,
+            set_panel(chat_id, (
                 "⚠️ <b>الرصيد غير كافٍ</b>\n\n"
                 f"رصيدك الحالي: <b>{fmt_amount(u['balance'])}</b>\n"
-                f"المبلغ المطلوب: <b>{fmt_amount(amount)}</b>",
-                inline([nav_row("home")])
-            )
+                f"المبلغ المطلوب: <b>{fmt_amount(amount)}</b>"
+            ), inline([nav_row("home")]))
             return True
-        set_panel(
-            chat_id,
-            "🧪 <b>الواجهة جاهزة للاختبار</b>\n\n"
-            "لم يتم إرسال أي مبلغ إلى iChancy لأن الجسر لم يتم ربطه بعد.",
-            inline([nav_row("home")])
-        )
+        set_panel(chat_id, "🧪 <b>الواجهة جاهزة للاختبار</b>\n\nلم يتم إرسال أي مبلغ إلى iChancy لأن الجسر لم يتم ربطه بعد.", inline([nav_row("home")]))
         return True
 
     if step == "gift_code":
         flows.pop(chat_id, None)
         result = redeem_gift_code(chat_id, text)
         if result.get("ok"):
-            set_panel(
-                chat_id,
+            set_panel(chat_id, (
                 "🎉 <b>تم استخدام كود الهدية بنجاح</b>\n\n"
                 f"💰 تمت إضافة: <b>{fmt_amount(result['amount'])}</b>\n"
                 f"💳 رصيدك الحالي: <b>{fmt_amount(result['after'])}</b>\n"
-                f"🧾 <code>{html.escape(result['tx_code'])}</code>",
-                inline([nav_row("home")])
-            )
+                f"🧾 <code>{html.escape(result['tx_code'])}</code>"
+            ), inline([nav_row("home")]))
             return True
-
         reason = result.get("reason")
         if reason == "used":
             msg = "❌ <b>تم استخدام كود الهدية مسبقًا.</b>"
@@ -1403,6 +1432,9 @@ def handle_menu_text(chat_id, text):
     return False
 
 
+# -----------------------------------------------------------------------------
+# Callback dispatcher
+# -----------------------------------------------------------------------------
 def handle_callback(query):
     callback_id = query.get("id")
     data = query.get("data", "")
@@ -1410,10 +1442,11 @@ def handle_callback(query):
     chat_id = (message.get("chat") or {}).get("id")
     if not chat_id:
         return
+
     if message.get("message_id"):
         panel_message_ids[chat_id] = message["message_id"]
+        panel_message_kinds[chat_id] = "photo" if message.get("photo") else "text"
 
-    # Stop Telegram's loading spinner immediately, then render the requested panel.
     answer_callback(callback_id)
 
     if data == "home":
@@ -1423,28 +1456,32 @@ def handle_callback(query):
         show_account(chat_id)
     elif data == "ichancy_create":
         flows[chat_id] = {"step": "ichancy_username"}
-        set_panel(
-            chat_id,
-            "👤 <b>اكتب اسم المستخدم</b>",
-            inline([nav_row("account", "🔙 إلغاء")])
-        )
+        set_panel(chat_id, "👤 <b>اكتب اسم المستخدم</b>", inline([nav_row("account", "🔙 إلغاء")]))
     elif data == "ichancy_toggle_password":
         password_visible[chat_id] = not password_visible.get(chat_id, False)
         show_account(chat_id)
     elif data == "topup":
+        flows.pop(chat_id, None)
         show_topup(chat_id)
-    elif data == "topup_usdt":
-        show_usdt_networks(chat_id)
     elif data == "topup_sham":
         show_sham_cash_currency(chat_id)
     elif data == "topup_sham_syp":
-        show_topup_amount_prompt(chat_id, "Sham Cash ليرة", "SYP", MIN_TOPUP_SYP, "topup_sham")
+        flows.pop(chat_id, None)
+        show_sham_syp_payment(chat_id)
+    elif data == "sham_syp_done":
+        flows[chat_id] = {"step": "sham_syp_amount"}
+        set_panel(chat_id, (
+            "💰 <b>اكتب المبلغ الذي حولته</b>\n\n"
+            f"🔻 الحد الأدنى: <b>{fmt_amount(MIN_TOPUP_SYP)} ل.س</b>"
+        ), inline([nav_row("topup_sham_syp", "🔙 إلغاء")]))
     elif data == "topup_sham_usd":
         show_topup_amount_prompt(chat_id, "Sham Cash Dollar", "USD", MIN_TOPUP_USD, "topup_sham")
     elif data == "topup_syriatel":
         show_topup_amount_prompt(chat_id, "Syriatel Cash", "SYP", MIN_TOPUP_SYP, "topup")
     elif data == "topup_wish":
         show_topup_amount_prompt(chat_id, "Wish Money", "USD", MIN_TOPUP_USD, "topup")
+    elif data == "topup_usdt":
+        show_usdt_networks(chat_id)
     elif data == "usdt_trc20":
         show_topup_amount_prompt(chat_id, "USDT - TRC20", "USD", MIN_TOPUP_USD, "topup_usdt")
     elif data == "usdt_bep20":
@@ -1453,9 +1490,9 @@ def handle_callback(query):
         flows.pop(chat_id, None)
         show_withdraw_bot(chat_id)
     elif data == "wd_sham":
-        show_withdraw_method(chat_id, "شام كاش")
+        show_withdraw_method(chat_id, "Sham Cash")
     elif data == "wd_syriatel":
-        show_withdraw_method(chat_id, "سيريتيل كاش")
+        show_withdraw_method(chat_id, "Syriatel Cash")
     elif data == "wd_usdt":
         show_withdraw_method(chat_id, "USDT")
     elif data == "wd_wish":
@@ -1488,6 +1525,9 @@ def handle_callback(query):
         answer_callback(callback_id, "هذا الخيار قيد التجهيز", True)
 
 
+# -----------------------------------------------------------------------------
+# Flask routes
+# -----------------------------------------------------------------------------
 @app.before_request
 def prepare_storage():
     if db_enabled():
@@ -1496,12 +1536,18 @@ def prepare_storage():
 
 @app.route("/")
 def home():
-    return "Asmar Robert Bot UI + PostgreSQL ledger v16 is running ✅"
+    return "Al Asmar customer bot v18 is running ✅"
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "mode": "ui-prototype", "storage": "postgres" if db_enabled() else "memory", "ledger": "v17-sham-cash-menu"})
+    return jsonify({
+        "ok": True,
+        "mode": "ui-prototype",
+        "storage": "postgres" if db_enabled() else "memory",
+        "ledger": "v18-sham-syp-qr-request",
+        "sham_qr": os.path.exists(SHAM_SYP_QR_PATH),
+    })
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1532,7 +1578,6 @@ def webhook():
     chat_id = (message.get("chat") or {}).get("id")
     text = message.get("text", "")
     message_id = message.get("message_id")
-
     if not chat_id:
         return jsonify({"ok": True})
 
@@ -1544,6 +1589,7 @@ def webhook():
             raw_ref = parts[1][4:]
             if raw_ref.isdigit():
                 referrer_id = int(raw_ref)
+
     upsert_user(
         chat_id,
         telegram_username=sender.get("username"),
@@ -1553,8 +1599,6 @@ def webhook():
 
     if text.startswith("/start") or text.startswith("/menu"):
         flows.pop(chat_id, None)
-        # Always send a NEW home message under /start instead of editing an old
-        # menu above in the conversation.
         show_home(chat_id, force_new=True)
         return jsonify({"ok": True})
 
@@ -1562,26 +1606,6 @@ def webhook():
         send_message(chat_id, f"🆔 معرفك على البوت: <code>{chat_id}</code>")
         return jsonify({"ok": True})
 
-    # Admin-only temporary UI testing helper. It DOES NOT move real money.
-    # Example: /testcredit 200000
-    if text.startswith("/testcredit") and chat_id == ADMIN_ID:
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            amount = parse_amount(parts[1])
-            if amount is not None:
-                before, after, code = set_test_balance_with_ledger(chat_id, amount)
-                send_message(
-                    chat_id,
-                    "🧪 تم ضبط الرصيد التجريبي\n"
-                    f"💰 الرصيد: <b>{fmt_amount(after)}</b>\n"
-                    f"🧾 <code>{code}</code>"
-                )
-                return jsonify({"ok": True})
-        send_message(chat_id, "الاستخدام: <code>/testcredit 200000</code>")
-        return jsonify({"ok": True})
-
-    # Process first, then remove the customer's input. This prevents a message
-    # from disappearing into silence if a handler ever throws an exception.
     try:
         if process_text_input(chat_id, text):
             if message_id:
@@ -1593,30 +1617,26 @@ def webhook():
                 delete_message(chat_id, message_id)
             return jsonify({"ok": True})
 
-        # Unknown text: keep user inside the designed interface.
-        set_panel(
-            chat_id,
-            "👑 اختر الخدمة المطلوبة من القائمة.",
-            main_inline_keyboard()
-        )
+        set_panel(chat_id, "👑 اختر الخدمة المطلوبة من القائمة.", main_inline_keyboard())
         if message_id:
             delete_message(chat_id, message_id)
     except Exception as exc:
         print("Message handler error:", repr(exc), flush=True)
         traceback.print_exc()
         send_message(chat_id, "⚠️ حدث خطأ مؤقت، حاول مرة ثانية.")
+
     return jsonify({"ok": True})
 
 
 @app.route("/diagnostics")
 def diagnostics():
-    """Safe operational status: no tokens, passwords, or DB URLs are exposed."""
     wh = tg("getWebhookInfo", timeout=5)
     result = wh.get("result") or {} if isinstance(wh, dict) else {}
     return jsonify({
         "ok": True,
-        "version": "v14-ui-speed",
+        "version": "v18-sham-syp-qr-request",
         "db": "postgres" if db_enabled() else "memory",
+        "sham_qr": os.path.exists(SHAM_SYP_QR_PATH),
         "webhook_pending_updates": result.get("pending_update_count"),
         "last_webhook_error": result.get("last_error_message"),
     })
@@ -1625,9 +1645,8 @@ def diagnostics():
 @app.route("/set-webhook")
 def set_webhook():
     ensure_native_menu()
-    webhook_url = f"{PUBLIC_BASE_URL}/webhook"
     response = tg("setWebhook", {
-        "url": webhook_url,
+        "url": f"{PUBLIC_BASE_URL}/webhook",
         "secret_token": WEBHOOK_SECRET,
         "allowed_updates": ["message", "callback_query"],
         "drop_pending_updates": False,
