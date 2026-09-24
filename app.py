@@ -4,10 +4,12 @@ import html
 import json
 import base64
 import hashlib
+import hmac
 import secrets
 import traceback
 import time
 import threading
+import uuid
 from io import BytesIO
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -35,6 +37,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://asmar-robert-bot.onrender.com"
 ).rstrip("/")
+BRIDGE_SHARED_SECRET = os.environ.get("BRIDGE_SHARED_SECRET", "").strip()
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
@@ -277,6 +280,39 @@ def ensure_db():
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_requests_topup_method_ref
                 ON cash_requests(method, (details->>'operation_ref'))
                 WHERE request_type='topup' AND details ? 'operation_ref'
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bridge_devices (
+                    device_id TEXT PRIMARY KEY,
+                    device_name TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'offline',
+                    ichancy_connected BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_heartbeat TIMESTAMPTZ,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bridge_jobs (
+                    job_id UUID PRIMARY KEY,
+                    request_id TEXT UNIQUE NOT NULL,
+                    job_type TEXT NOT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    claimed_by TEXT,
+                    result JSONB,
+                    error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    started_at TIMESTAMPTZ,
+                    finished_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_bridge_jobs_pending
+                ON bridge_jobs(status, created_at)
             """)
             for method, percent in DEFAULT_BONUSES.items():
                 cur.execute(
@@ -1607,6 +1643,155 @@ def handle_callback(query):
         show_terms(chat_id)
     else:
         answer_callback(callback_id, "هذا الخيار قيد التجهيز", True)
+
+
+# -----------------------------------------------------------------------------
+# Bridge device API
+# -----------------------------------------------------------------------------
+def bridge_authorized(req):
+    supplied = req.headers.get("X-Bridge-Key", "")
+    return bool(BRIDGE_SHARED_SECRET) and hmac.compare_digest(supplied, BRIDGE_SHARED_SECRET)
+
+
+def bridge_json_error(message, status=400):
+    return jsonify({"ok": False, "error": message}), status
+
+
+def enqueue_bridge_job(request_id, job_type, payload):
+    """Create one outbound job; request_id makes financial commands idempotent."""
+    if not db_enabled():
+        raise RuntimeError("postgres_required")
+    ensure_db()
+    job_id = str(uuid.uuid4())
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bridge_jobs(job_id, request_id, job_type, payload)
+                VALUES(%s,%s,%s,%s)
+                ON CONFLICT(request_id) DO NOTHING
+                RETURNING job_id, request_id, status
+            """, (job_id, request_id, job_type, Json(payload or {})))
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            cur.execute("SELECT job_id, request_id, status FROM bridge_jobs WHERE request_id=%s", (request_id,))
+            return dict(cur.fetchone())
+
+
+@app.route("/bridge/v1/heartbeat", methods=["POST"])
+def bridge_heartbeat():
+    if not bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    device_id = str(body.get("device_id", "")).strip()
+    device_name = str(body.get("device_name", device_id)).strip()[:120]
+    if not device_id or not device_name:
+        return bridge_json_error("device_id and device_name are required")
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bridge_devices(device_id, device_name, status, ichancy_connected, last_heartbeat, metadata)
+                VALUES(%s,%s,'online',%s,NOW(),%s)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    device_name=EXCLUDED.device_name,
+                    status='online',
+                    ichancy_connected=EXCLUDED.ichancy_connected,
+                    last_heartbeat=NOW(),
+                    metadata=EXCLUDED.metadata,
+                    updated_at=NOW()
+            """, (device_id, device_name, bool(body.get("ichancy_connected")), Json(body.get("metadata") or {})))
+    return jsonify({"ok": True, "device_id": device_id, "status": "online", "server_time": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/bridge/v1/jobs/next", methods=["POST"])
+def bridge_next_job():
+    if not bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    device_id = str(body.get("device_id", "")).strip()
+    if not device_id or not db_enabled():
+        return bridge_json_error("device_id and postgres are required", 503 if not db_enabled() else 400)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM bridge_devices
+                WHERE device_id=%s AND last_heartbeat > NOW() - INTERVAL '2 minutes'
+            """, (device_id,))
+            if not cur.fetchone():
+                return bridge_json_error("device_not_registered_or_stale", 409)
+            # Requeue work abandoned by a disconnected bridge after 2 minutes.
+            cur.execute("""
+                UPDATE bridge_jobs SET status='pending', claimed_by=NULL, updated_at=NOW()
+                WHERE status='running' AND updated_at < NOW() - INTERVAL '2 minutes'
+            """)
+            cur.execute("""
+                SELECT job_id::text AS job_id, request_id, job_type, payload, attempts
+                FROM bridge_jobs
+                WHERE status='pending'
+                ORDER BY created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"ok": True, "job": None})
+            cur.execute("""
+                UPDATE bridge_jobs
+                SET status='running', attempts=attempts+1, claimed_by=%s,
+                    started_at=COALESCE(started_at,NOW()), updated_at=NOW()
+                WHERE job_id=%s
+            """, (device_id, row["job_id"]))
+    return jsonify({"ok": True, "job": dict(row)})
+
+
+@app.route("/bridge/v1/jobs/<job_id>/complete", methods=["POST"])
+def bridge_complete_job(job_id):
+    if not bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    device_id = str(body.get("device_id", "")).strip()
+    status = body.get("status")
+    if status not in {"succeeded", "failed"}:
+        return bridge_json_error("status must be succeeded or failed")
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE bridge_jobs
+                SET status=%s, result=%s, error=%s, finished_at=NOW(), updated_at=NOW()
+                WHERE job_id=%s AND status='running' AND claimed_by=%s
+                RETURNING job_id::text AS job_id, request_id, status
+            """, (status, Json(body.get("result") or {}), str(body.get("error", ""))[:500] or None, job_id, device_id))
+            row = cur.fetchone()
+            if not row:
+                cur.execute("SELECT job_id::text AS job_id, request_id, status FROM bridge_jobs WHERE job_id=%s", (job_id,))
+                row = cur.fetchone()
+                if not row:
+                    return bridge_json_error("job_not_found", 404)
+    return jsonify({"ok": True, "job": dict(row)})
+
+
+@app.route("/bridge/status", methods=["GET"])
+def bridge_status():
+    if not db_enabled():
+        return jsonify({"ok": True, "bridge": None, "reason": "postgres_required"})
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT device_id, device_name,
+                       CASE WHEN last_heartbeat > NOW() - INTERVAL '90 seconds' THEN 'online' ELSE 'offline' END AS status,
+                       ichancy_connected, last_heartbeat, metadata
+                FROM bridge_devices ORDER BY updated_at DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+    return jsonify({"ok": True, "bridge": dict(row) if row else None})
 
 
 # -----------------------------------------------------------------------------
