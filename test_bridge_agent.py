@@ -11,7 +11,7 @@ class BridgeRouteTests(unittest.TestCase):
         self.client = app.test_client()
 
     def test_status_is_readable_without_database(self):
-        response = self.client.get("/bridge/status")
+        response = self.client.get("/bridge/status", headers={"X-Bridge-Key": "test-secret"})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["ok"])
 

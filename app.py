@@ -1779,6 +1779,8 @@ def bridge_complete_job(job_id):
 
 @app.route("/bridge/status", methods=["GET"])
 def bridge_status():
+    if not bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
     if not db_enabled():
         return jsonify({"ok": True, "bridge": None, "reason": "postgres_required"})
     ensure_db()
@@ -1791,7 +1793,9 @@ def bridge_status():
                 FROM bridge_devices ORDER BY updated_at DESC LIMIT 1
             """)
             row = cur.fetchone()
-    return jsonify({"ok": True, "bridge": dict(row) if row else None})
+            cur.execute("SELECT status, COUNT(*) AS count FROM bridge_jobs GROUP BY status")
+            jobs = {item["status"]: int(item["count"]) for item in cur.fetchall()}
+    return jsonify({"ok": True, "bridge": dict(row) if row else None, "jobs": jobs})
 
 
 # -----------------------------------------------------------------------------

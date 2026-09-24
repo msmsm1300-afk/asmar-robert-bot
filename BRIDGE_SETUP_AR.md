@@ -37,7 +37,17 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 يُخزّن زوج iChancy Token في ملف مشفّر بصلاحيات `0600` على الجهاز الوسيط. لا يطبع Bridge كلمات المرور أو Tokens في السجلات.
 
-## التشغيل
+## تشغيل التطبيق
+
+انسخ `.env.bridge.example` إلى `.env` على الجهاز الوسيط، واملأ القيم محليًا. بعد ذلك شغّل التطبيق:
+
+```bash
+python bridge_desktop_app.py
+```
+
+ستظهر نافذة صغيرة فيها حالة Bridge وiChancy وآخر Heartbeat وعدد Jobs، مع زري تشغيل وإيقاف وزر فتح iChancy. التطبيق يشغّل `bridge_agent.py` داخليًا ولا تحتاج إلى إبقاء نافذة Terminal مفتوحة.
+
+## التشغيل اليدوي (للتشخيص فقط)
 
 ```bash
 python bridge_agent.py
