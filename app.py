@@ -25,6 +25,7 @@ from psycopg2.pool import ThreadedConnectionPool
 from requests.adapters import HTTPAdapter
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, request, jsonify
+from ichancy_provider import IchancyAgentClient
 
 app = Flask(__name__)
 
@@ -47,6 +48,7 @@ _DB_POOL_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 _BONUS_CACHE = {"expires": 0.0, "value": {}}
 _SUPPORT_CACHE = {"expires": 0.0, "value": []}
+_ICHANCY_CLIENT = None
 
 flows = {}
 panel_message_ids = {}
@@ -174,11 +176,20 @@ def ensure_db():
                     balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
                     ichancy_username TEXT UNIQUE,
                     ichancy_password_enc TEXT,
+                    ichancy_player_id TEXT UNIQUE,
+                    ichancy_currency TEXT,
                     referred_by BIGINT,
                     referral_earnings BIGINT NOT NULL DEFAULT 0,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+            """)
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ichancy_player_id TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ichancy_currency TEXT")
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_ichancy_player_id
+                ON users (ichancy_player_id)
+                WHERE ichancy_player_id IS NOT NULL
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS transactions (
@@ -307,6 +318,8 @@ def upsert_user(chat_id, telegram_username=None, first_name=None, referred_by=No
                 "balance": 0,
                 "ichancy_username": None,
                 "ichancy_password": None,
+                "ichancy_player_id": None,
+                "ichancy_currency": None,
                 "referred_by": referred_by,
                 "referral_earnings": 0,
             }
@@ -352,6 +365,8 @@ def get_user(chat_id):
         "balance": int(row["balance"] or 0),
         "ichancy_username": row["ichancy_username"],
         "ichancy_password": decrypt_secret(row["ichancy_password_enc"]),
+        "ichancy_player_id": row.get("ichancy_player_id"),
+        "ichancy_currency": row.get("ichancy_currency"),
         "password_visible": password_visible.get(chat_id, False),
         "referred_by": row["referred_by"],
         "referral_earnings": int(row["referral_earnings"] or 0),
@@ -377,6 +392,66 @@ def save_ichancy_credentials(chat_id, username, password):
         return True, None
     except psycopg2.errors.UniqueViolation:
         return False, "username_exists"
+
+
+def save_ichancy_player_mapping(chat_id, player_id, username=None, currency=None):
+    """Persist the real iChancy Player mapping; never stores an access token."""
+    player_id = str(player_id).strip()
+    if not player_id:
+        return False, "invalid_player_id"
+    if not db_enabled():
+        get_user(chat_id)
+        users_mem[chat_id]["ichancy_player_id"] = player_id
+        users_mem[chat_id]["ichancy_currency"] = currency
+        if username:
+            users_mem[chat_id]["ichancy_username"] = username
+        return True, None
+
+    ensure_db()
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE users
+                    SET ichancy_player_id=%s,
+                        ichancy_username=COALESCE(%s, ichancy_username),
+                        ichancy_currency=COALESCE(%s, ichancy_currency),
+                        updated_at=NOW()
+                    WHERE telegram_id=%s
+                """, (player_id, username, currency, chat_id))
+        return True, None
+    except psycopg2.errors.UniqueViolation:
+        return False, "player_exists"
+
+
+def ichancy_client():
+    """Return one process-wide Agent API client; never sign in per request."""
+    global _ICHANCY_CLIENT
+    if _ICHANCY_CLIENT is None:
+        _ICHANCY_CLIENT = IchancyAgentClient()
+    return _ICHANCY_CLIENT
+
+
+def fetch_ichancy_balance(chat_id):
+    """Read the real iChancy balance for a mapped Player, without mutations."""
+    user = get_user(chat_id)
+    player_id = user.get("ichancy_player_id")
+    if not player_id:
+        return {"ok": False, "reason": "player_not_mapped"}
+    try:
+        payload = ichancy_client().get_player_balance(player_id)
+        result = payload.get("result") or []
+        main = next((item for item in result if item.get("main")), result[0] if result else None)
+        if not main:
+            return {"ok": False, "reason": "balance_not_found"}
+        return {
+            "ok": True,
+            "balance": main.get("balance"),
+            "currency": main.get("currencyCode") or user.get("ichancy_currency"),
+        }
+    except Exception as exc:
+        # Do not expose credentials, tokens, or upstream response bodies to Telegram.
+        return {"ok": False, "reason": type(exc).__name__}
 
 
 def username_taken(username, except_chat_id=None):
@@ -835,7 +910,7 @@ def show_home(chat_id, force_new=False):
 def show_account(chat_id, created=False):
     u = get_user(chat_id)
     flows.pop(chat_id, None)
-    if not u["ichancy_username"]:
+    if not u["ichancy_player_id"] and not u["ichancy_username"]:
         return set_panel(
             chat_id,
             "🎮 <b>حساب iChancy</b> 🎮\n\nلا يوجد حساب iChancy مرتبط بحسابك حاليًا.",
@@ -844,12 +919,21 @@ def show_account(chat_id, created=False):
 
     pwd = u["ichancy_password"] or ""
     shown = html.escape(pwd) if u.get("password_visible") else "••••••••"
-    username = html.escape(u["ichancy_username"])
+    username = html.escape(u["ichancy_username"] or "غير متاح")
     title = "✅ <b>تم إنشاء حسابك بنجاح</b>" if created else "🔐 <b>بيانات تسجيل الدخول للحساب</b>"
+    balance_line = ""
+    if u.get("ichancy_player_id"):
+        balance = fetch_ichancy_balance(chat_id)
+        if balance.get("ok"):
+            balance_line = f"\n💰 الرصيد الحقيقي: <b>{html.escape(str(balance['balance']))} {html.escape(str(balance.get('currency') or ''))}</b>\n"
+        else:
+            balance_line = "\n💰 الرصيد الحقيقي: <i>تعذر جلبه حاليًا، حاول لاحقًا</i>\n"
     text = (
         f"{title}\n\n"
         f"👤 اسم المستخدم: <code>{username}</code>\n"
-        f"🔑 كلمة المرور: <code>{shown}</code>"
+        f"🔑 كلمة المرور: <code>{shown}</code>\n"
+        f"🆔 Player ID: <code>{html.escape(str(u.get('ichancy_player_id') or 'غير مربوط'))}</code>\n"
+        f"{balance_line}"
     )
     toggle = "🙈 إخفاء كلمة المرور" if u.get("password_visible") else "👁 عرض كلمة المرور"
     return set_panel(chat_id, text, inline([
