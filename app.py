@@ -1878,7 +1878,12 @@ def bridge_complete_job(job_id):
         if chat_id and status == "succeeded" and result.get("player_id"):
             set_panel(int(chat_id), "✅ <b>تم إنشاء حساب iChancy بنجاح</b>\n\nتم ربط الحساب ببياناتك. يمكنك فتح حساب iChancy لعرض اسم المستخدم وكلمة المرور وPlayer ID.", inline([nav_row("account", "🎮 فتح الحساب")]))
         elif chat_id:
-            set_panel(int(chat_id), "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا.", inline([[cb("🔁 إعادة المحاولة", "ichancy_create")], nav_row("account")]))
+            error = str(body.get("error") or "")
+            if error == "username_taken":
+                message = "⚠️ <b>اسم المستخدم مستخدم من قبل.</b>\n\nيرجى اختيار اسم مستخدم إنكليزي جديد مع أرقام، مثل: <code>Ahmad129</code>."
+            else:
+                message = "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا."
+            set_panel(int(chat_id), message, inline([[cb("🔁 اختيار اسم آخر", "ichancy_create")], nav_row("account")]))
     return jsonify({"ok": True, "job": dict(row)})
 
 
