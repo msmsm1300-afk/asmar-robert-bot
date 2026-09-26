@@ -38,6 +38,7 @@ PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://asmar-robert-bot.onrender.com"
 ).rstrip("/")
 BRIDGE_SHARED_SECRET = os.environ.get("BRIDGE_SHARED_SECRET", "").strip()
+PLAYER_EMAIL_DOMAIN = os.environ.get("ICHANCY_PLAYER_EMAIL_DOMAIN", "asmarrobert.example").strip().lower()
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
@@ -181,6 +182,8 @@ def ensure_db():
                     ichancy_password_enc TEXT,
                     ichancy_player_id TEXT UNIQUE,
                     ichancy_currency TEXT,
+                    ichancy_creation_status TEXT,
+                    ichancy_creation_job_id TEXT,
                     referred_by BIGINT,
                     referral_earnings BIGINT NOT NULL DEFAULT 0,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -189,6 +192,8 @@ def ensure_db():
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ichancy_player_id TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ichancy_currency TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ichancy_creation_status TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ichancy_creation_job_id TEXT")
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_ichancy_player_id
                 ON users (ichancy_player_id)
@@ -356,6 +361,8 @@ def upsert_user(chat_id, telegram_username=None, first_name=None, referred_by=No
                 "ichancy_password": None,
                 "ichancy_player_id": None,
                 "ichancy_currency": None,
+                "ichancy_creation_status": None,
+                "ichancy_creation_job_id": None,
                 "referred_by": referred_by,
                 "referral_earnings": 0,
             }
@@ -403,6 +410,8 @@ def get_user(chat_id):
         "ichancy_password": decrypt_secret(row["ichancy_password_enc"]),
         "ichancy_player_id": row.get("ichancy_player_id"),
         "ichancy_currency": row.get("ichancy_currency"),
+        "ichancy_creation_status": row.get("ichancy_creation_status"),
+        "ichancy_creation_job_id": row.get("ichancy_creation_job_id"),
         "password_visible": password_visible.get(chat_id, False),
         "referred_by": row["referred_by"],
         "referral_earnings": int(row["referral_earnings"] or 0),
@@ -946,6 +955,12 @@ def show_home(chat_id, force_new=False):
 def show_account(chat_id, created=False):
     u = get_user(chat_id)
     flows.pop(chat_id, None)
+    if not u["ichancy_player_id"] and u.get("ichancy_creation_status") in {"pending", "running"}:
+        return set_panel(
+            chat_id,
+            "⏳ <b>جارٍ إنشاء حساب iChancy</b>\n\nتم إرسال طلبك إلى جهاز الوسيط. ستصلك رسالة تلقائيًا عند اكتمال الإنشاء. لا تعِد إرسال الطلب.",
+            inline([nav_row("home")]),
+        )
     if not u["ichancy_player_id"] and not u["ichancy_username"]:
         return set_panel(
             chat_id,
@@ -1377,7 +1392,13 @@ def process_text_input(chat_id, text):
             return True
         password_visible[chat_id] = False
         flows.pop(chat_id, None)
-        show_account(chat_id, created=True)
+        registration = enqueue_player_registration(chat_id, flow["username"], password)
+        if registration.get("ok"):
+            set_panel(chat_id, "⏳ <b>جارٍ إنشاء حساب iChancy</b>\n\nتم استلام اسم المستخدم وكلمة المرور. يتحقق جهاز الوسيط من أن الاسم غير مستخدم في iChancy ثم ينشئ الحساب. ستصلك رسالة تلقائيًا عند النتيجة.", inline([nav_row("home")]))
+        elif registration.get("reason") == "already_pending":
+            show_account(chat_id)
+        else:
+            set_panel(chat_id, "⚠️ <b>تعذر بدء إنشاء الحساب حاليًا.</b>\n\nلم يتم إنشاء أي حساب في iChancy. حاول لاحقًا.", inline([[cb("🔁 إعادة المحاولة", "ichancy_create")], nav_row("account")]))
         return True
 
     if step == "sham_syp_amount":
@@ -1678,6 +1699,42 @@ def enqueue_bridge_job(request_id, job_type, payload):
             return dict(cur.fetchone())
 
 
+def generated_player_email(username, chat_id):
+    """Generate a non-customer-facing address required by the official API."""
+    local = re.sub(r"[^a-z0-9]", "", str(username).lower())[:24]
+    return f"{local}.{int(chat_id)}@{PLAYER_EMAIL_DOMAIN}"
+
+
+def enqueue_player_registration(chat_id, username, password):
+    """Queue one idempotent Player registration for the outbound phone Bridge."""
+    if not db_enabled():
+        return {"ok": False, "reason": "postgres_required"}
+    ensure_db()
+    user = get_user(chat_id)
+    if user.get("ichancy_player_id"):
+        return {"ok": False, "reason": "already_mapped"}
+    if user.get("ichancy_creation_status") in {"pending", "running"}:
+        return {"ok": False, "reason": "already_pending", "job_id": user.get("ichancy_creation_job_id")}
+
+    payload = {
+        "telegram_id": int(chat_id),
+        "username": username,
+        "email": generated_player_email(username, chat_id),
+    }
+    request_id = f"register-player:{chat_id}:{username.lower()}:{uuid.uuid4()}"
+    job = enqueue_bridge_job(request_id, "register_player", payload)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE users
+                SET ichancy_creation_status='pending',
+                    ichancy_creation_job_id=%s,
+                    updated_at=NOW()
+                WHERE telegram_id=%s
+            """, (str(job["job_id"]), chat_id))
+    return {"ok": True, "job_id": str(job["job_id"])}
+
+
 @app.route("/bridge/v1/heartbeat", methods=["POST"])
 def bridge_heartbeat():
     if not bridge_authorized(request):
@@ -1712,6 +1769,10 @@ def bridge_next_job():
         return bridge_json_error("unauthorized", 401)
     body = request.get_json(silent=True) or {}
     device_id = str(body.get("device_id", "")).strip()
+    requested_types = body.get("job_types") or []
+    if not isinstance(requested_types, list):
+        return bridge_json_error("job_types must be an array")
+    requested_types = [str(item) for item in requested_types if str(item) in {"register_player", "get_players", "get_balance", "deposit", "withdraw"}]
     if not device_id or not db_enabled():
         return bridge_json_error("device_id and postgres are required", 503 if not db_enabled() else 400)
     ensure_db()
@@ -1728,14 +1789,24 @@ def bridge_next_job():
                 UPDATE bridge_jobs SET status='pending', claimed_by=NULL, updated_at=NOW()
                 WHERE status='running' AND updated_at < NOW() - INTERVAL '2 minutes'
             """)
-            cur.execute("""
-                SELECT job_id::text AS job_id, request_id, job_type, payload, attempts
-                FROM bridge_jobs
-                WHERE status='pending'
-                ORDER BY created_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            """)
+            if requested_types:
+                cur.execute("""
+                    SELECT job_id::text AS job_id, request_id, job_type, payload, attempts
+                    FROM bridge_jobs
+                    WHERE status='pending' AND job_type = ANY(%s)
+                    ORDER BY created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                """, (requested_types,))
+            else:
+                cur.execute("""
+                    SELECT job_id::text AS job_id, request_id, job_type, payload, attempts
+                    FROM bridge_jobs
+                    WHERE status='pending'
+                    ORDER BY created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                """)
             row = cur.fetchone()
             if not row:
                 return jsonify({"ok": True, "job": None})
@@ -1760,6 +1831,8 @@ def bridge_complete_job(job_id):
     if not db_enabled():
         return bridge_json_error("postgres_required", 503)
     ensure_db()
+    completed_job = None
+    accepted_completion = False
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1769,12 +1842,77 @@ def bridge_complete_job(job_id):
                 RETURNING job_id::text AS job_id, request_id, status
             """, (status, Json(body.get("result") or {}), str(body.get("error", ""))[:500] or None, job_id, device_id))
             row = cur.fetchone()
+            accepted_completion = bool(row)
             if not row:
                 cur.execute("SELECT job_id::text AS job_id, request_id, status FROM bridge_jobs WHERE job_id=%s", (job_id,))
                 row = cur.fetchone()
                 if not row:
                     return bridge_json_error("job_not_found", 404)
+            cur.execute("SELECT job_type, payload, result FROM bridge_jobs WHERE job_id=%s", (job_id,))
+            completed_job = cur.fetchone()
+            if accepted_completion and completed_job and completed_job.get("job_type") == "register_player":
+                payload = completed_job.get("payload") or {}
+                telegram_id = payload.get("telegram_id")
+                result = completed_job.get("result") or {}
+                player_id = str(result.get("player_id") or "").strip()
+                if telegram_id and status == "succeeded" and player_id:
+                    cur.execute("""
+                        UPDATE users
+                        SET ichancy_player_id=%s,
+                            ichancy_username=COALESCE(%s, ichancy_username),
+                            ichancy_currency=COALESCE(%s, ichancy_currency),
+                            ichancy_creation_status='succeeded',
+                            updated_at=NOW()
+                        WHERE telegram_id=%s
+                    """, (player_id, payload.get("username"), result.get("currency"), int(telegram_id)))
+                elif telegram_id:
+                    cur.execute("""
+                        UPDATE users
+                        SET ichancy_creation_status='failed', updated_at=NOW()
+                        WHERE telegram_id=%s
+                    """, (int(telegram_id),))
+    if accepted_completion and completed_job and completed_job.get("job_type") == "register_player":
+        payload = completed_job.get("payload") or {}
+        chat_id = payload.get("telegram_id")
+        result = completed_job.get("result") or {}
+        if chat_id and status == "succeeded" and result.get("player_id"):
+            set_panel(int(chat_id), "✅ <b>تم إنشاء حساب iChancy بنجاح</b>\n\nتم ربط الحساب ببياناتك. يمكنك فتح حساب iChancy لعرض اسم المستخدم وكلمة المرور وPlayer ID.", inline([nav_row("account", "🎮 فتح الحساب")]))
+        elif chat_id:
+            set_panel(int(chat_id), "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا.", inline([[cb("🔁 إعادة المحاولة", "ichancy_create")], nav_row("account")]))
     return jsonify({"ok": True, "job": dict(row)})
+
+
+@app.route("/bridge/v1/jobs/<job_id>/credentials", methods=["POST"])
+def bridge_job_credentials(job_id):
+    """Return an encrypted-at-rest player password only to the device running this job."""
+    if not bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    device_id = str(body.get("device_id", "")).strip()
+    if not device_id or not db_enabled():
+        return bridge_json_error("device_id and postgres are required", 503 if not db_enabled() else 400)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT payload
+                FROM bridge_jobs
+                WHERE job_id=%s AND job_type='register_player'
+                  AND status='running' AND claimed_by=%s
+                FOR UPDATE
+            """, (job_id, device_id))
+            job = cur.fetchone()
+            if not job:
+                return bridge_json_error("job_not_claimed_by_device", 409)
+            telegram_id = (job.get("payload") or {}).get("telegram_id")
+            if not telegram_id:
+                return bridge_json_error("job_payload_invalid", 422)
+            cur.execute("SELECT ichancy_password_enc FROM users WHERE telegram_id=%s", (int(telegram_id),))
+            user = cur.fetchone()
+    password = decrypt_secret((user or {}).get("ichancy_password_enc"))
+    if not password:
+        return bridge_json_error("player_password_unavailable", 409)
+    return jsonify({"ok": True, "password": password})
 
 
 @app.route("/bridge/status", methods=["GET"])
