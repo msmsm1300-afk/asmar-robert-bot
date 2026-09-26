@@ -1920,6 +1920,39 @@ def bridge_job_credentials(job_id):
     return jsonify({"ok": True, "password": password})
 
 
+@app.route("/internal/cleanup-unlinked-customers", methods=["POST"])
+def cleanup_unlinked_customers():
+    """One-time, explicit cleanup of customer records with no iChancy Player ID."""
+    if not bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    if body.get("confirmation") != "DELETE_UNLINKED_CUSTOMERS" or body.get("expected_count") != 8:
+        return bridge_json_error("explicit_confirmation_and_expected_count_required", 400)
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT telegram_id, balance
+                FROM users
+                WHERE ichancy_player_id IS NULL
+                FOR UPDATE
+            """)
+            targets = cur.fetchall()
+            if len(targets) != 8:
+                return bridge_json_error("target_count_changed", 409)
+            target_ids = [row["telegram_id"] for row in targets]
+            total_balance = sum(int(row["balance"] or 0) for row in targets)
+            cur.execute("DELETE FROM users WHERE telegram_id = ANY(%s)", (target_ids,))
+    return jsonify({
+        "ok": True,
+        "deleted_users": len(targets),
+        "deleted_bot_balance": total_balance,
+        "scope": "users_without_ichancy_player_id",
+    })
+
+
 @app.route("/bridge/status", methods=["GET"])
 def bridge_status():
     if not bridge_authorized(request):
