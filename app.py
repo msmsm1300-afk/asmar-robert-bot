@@ -1750,6 +1750,13 @@ def bridge_heartbeat():
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
+                UPDATE bridge_jobs
+                SET status='pending', claimed_by=NULL, updated_at=NOW()
+                WHERE job_type='register_player'
+                  AND status='running'
+                  AND updated_at < NOW() - INTERVAL '75 seconds'
+            """)
+            cur.execute("""
                 INSERT INTO bridge_devices(device_id, device_name, status, ichancy_connected, last_heartbeat, metadata)
                 VALUES(%s,%s,'online',%s,NOW(),%s)
                 ON CONFLICT(device_id) DO UPDATE SET
