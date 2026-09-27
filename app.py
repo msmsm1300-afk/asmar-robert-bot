@@ -1394,7 +1394,7 @@ def process_text_input(chat_id, text):
         flows.pop(chat_id, None)
         registration = enqueue_player_registration(chat_id, flow["username"], password)
         if registration.get("ok"):
-            set_panel(chat_id, "⏳ <b>جارٍ إنشاء حساب iChancy</b>\n\nتم استلام اسم المستخدم وكلمة المرور. يتحقق جهاز الوسيط من أن الاسم غير مستخدم في iChancy ثم ينشئ الحساب. ستصلك رسالة تلقائيًا عند النتيجة.", inline([nav_row("home")]))
+            set_panel(chat_id, "⏳ <b>جارٍ إنشاء حساب iChancy…</b>", inline([nav_row("home")]))
         elif registration.get("reason") == "already_pending":
             show_account(chat_id)
         else:
