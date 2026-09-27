@@ -1969,6 +1969,9 @@ def bridge_complete_job(job_id):
                 message = f"⚠️ <b>رفض iChancy إنشاء الحساب.</b>\n\nالرد: <code>{html.escape(detail)}</code>\n\nلم يتم اعتماد الحساب. تأكد من صلاحية Agent الأب ثم أعد المحاولة."
             elif error == "registration_timeout_45s":
                 message = "⚠️ <b>لم ترد صفحة iChancy خلال 45 ثانية.</b>\n\nلم يتم اعتماد الحساب. افتح صفحة iChancy يدويًا على الهاتف، أكمل أي تحقق ظاهر، ثم أعد المحاولة."
+            elif error.startswith("registration_runtime_error:"):
+                detail = error.split(":", 1)[1].strip()
+                message = f"⚠️ <b>توقف تنفيذ إنشاء الحساب داخل Bridge.</b>\n\nالتفصيل التقني: <code>{html.escape(detail[:180])}</code>"
             else:
                 message = "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا."
             set_panel(int(chat_id), message, inline([[cb("🔁 اختيار اسم آخر", "ichancy_create")], nav_row("account")]))
