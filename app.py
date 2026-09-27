@@ -287,6 +287,13 @@ def ensure_db():
                 WHERE request_type='topup' AND details ? 'operation_ref'
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_flows (
+                    telegram_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    flow JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS bridge_devices (
                     device_id TEXT PRIMARY KEY,
                     device_name TEXT NOT NULL,
@@ -325,6 +332,40 @@ def ensure_db():
                     (method, percent),
                 )
     _DB_INITIALIZED = True
+
+
+def load_persistent_flow(chat_id):
+    if not db_enabled():
+        return flows.get(chat_id)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT flow FROM conversation_flows WHERE telegram_id=%s", (int(chat_id),))
+            row = cur.fetchone()
+            return (row.get("flow") if row else None) or None
+
+
+def save_persistent_flow(chat_id, flow):
+    if not db_enabled():
+        return
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO conversation_flows(telegram_id, flow, updated_at)
+                   VALUES(%s, %s::jsonb, NOW())
+                   ON CONFLICT(telegram_id) DO UPDATE SET flow=EXCLUDED.flow, updated_at=NOW()""",
+                (int(chat_id), json.dumps(flow, ensure_ascii=False)),
+            )
+
+
+def delete_persistent_flow(chat_id):
+    if not db_enabled():
+        return
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM conversation_flows WHERE telegram_id=%s", (int(chat_id),))
 
 
 def get_bonuses():
@@ -949,12 +990,14 @@ def greeting(chat_id):
 
 def show_home(chat_id, force_new=False):
     flows.pop(chat_id, None)
+    delete_persistent_flow(chat_id)
     return set_panel(chat_id, greeting(chat_id), main_inline_keyboard(), force_new=force_new)
 
 
 def show_account(chat_id, created=False):
     u = get_user(chat_id)
     flows.pop(chat_id, None)
+    delete_persistent_flow(chat_id)
     if not u["ichancy_player_id"] and u.get("ichancy_creation_status") in {"pending", "running"}:
         return set_panel(
             chat_id,
@@ -965,6 +1008,13 @@ def show_account(chat_id, created=False):
         return set_panel(
             chat_id,
             "🎮 <b>حساب iChancy</b> 🎮\n\nلا يوجد حساب iChancy مرتبط بحسابك حاليًا.",
+            inline([[cb("➕ إنشاء حساب جديد", "ichancy_create")], nav_row("home")]),
+        )
+
+    if not u["ichancy_player_id"]:
+        return set_panel(
+            chat_id,
+            "⚠️ <b>لا يوجد حساب iChancy مرتبط حاليًا.</b>\n\nلم يكتمل آخر طلب إنشاء، ولم يتم اعتماد بيانات الدخول. يمكنك المحاولة من جديد.",
             inline([[cb("➕ إنشاء حساب جديد", "ichancy_create")], nav_row("home")]),
         )
 
@@ -1362,6 +1412,10 @@ def parse_decimal_amount(text):
 def process_text_input(chat_id, text):
     flow = flows.get(chat_id)
     if not flow:
+        flow = load_persistent_flow(chat_id)
+        if flow:
+            flows[chat_id] = flow
+    if not flow:
         return False
 
     step = flow.get("step")
@@ -1377,6 +1431,7 @@ def process_text_input(chat_id, text):
             return True
         flow["username"] = candidate
         flow["step"] = "ichancy_password"
+        save_persistent_flow(chat_id, flow)
         set_panel(chat_id, "🔐 <b>اكتب كلمة المرور</b>", inline([nav_row("account", "🔙 إلغاء")]))
         return True
 
@@ -1388,10 +1443,12 @@ def process_text_input(chat_id, text):
         ok, reason = save_ichancy_credentials(chat_id, flow["username"], password)
         if not ok:
             flow["step"] = "ichancy_username"
+            save_persistent_flow(chat_id, flow)
             set_panel(chat_id, "👤 <b>اكتب اسم المستخدم</b>\n\n❌ اسم المستخدم مستخدم من قبل، اختر اسمًا آخر.", inline([nav_row("account", "🔙 إلغاء")]))
             return True
         password_visible[chat_id] = False
         flows.pop(chat_id, None)
+        delete_persistent_flow(chat_id)
         registration = enqueue_player_registration(chat_id, flow["username"], password)
         if registration.get("ok"):
             set_panel(chat_id, "⏳ <b>جارٍ إنشاء حساب iChancy…</b>", inline([nav_row("home")]))
@@ -1597,6 +1654,7 @@ def handle_callback(query):
         show_account(chat_id)
     elif data == "ichancy_create":
         flows[chat_id] = {"step": "ichancy_username"}
+        save_persistent_flow(chat_id, flows[chat_id])
         set_panel(chat_id, "👤 <b>اكتب اسم المستخدم</b>", inline([nav_row("account", "🔙 إلغاء")]))
     elif data == "ichancy_toggle_password":
         password_visible[chat_id] = not password_visible.get(chat_id, False)
@@ -1906,6 +1964,9 @@ def bridge_complete_job(job_id):
             error = str(body.get("error") or "")
             if error == "username_taken":
                 message = "⚠️ <b>اسم المستخدم مستخدم من قبل.</b>\n\nيرجى اختيار اسم مستخدم إنكليزي جديد مع أرقام، مثل: <code>Ahmad129</code>."
+            elif error.startswith("register_player_http_"):
+                detail = error.removeprefix("register_player_http_").replace("_", " ")
+                message = f"⚠️ <b>رفض iChancy إنشاء الحساب.</b>\n\nالرد: <code>{html.escape(detail)}</code>\n\nلم يتم اعتماد الحساب. تأكد من صلاحية Agent الأب ثم أعد المحاولة."
             else:
                 message = "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا."
             set_panel(int(chat_id), message, inline([[cb("🔁 اختيار اسم آخر", "ichancy_create")], nav_row("account")]))
@@ -2040,6 +2101,7 @@ def webhook():
 
     if text.startswith("/start") or text.startswith("/menu"):
         flows.pop(chat_id, None)
+        delete_persistent_flow(chat_id)
         show_home(chat_id, force_new=True)
         return jsonify({"ok": True})
 
