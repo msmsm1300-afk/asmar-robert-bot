@@ -1945,6 +1945,34 @@ def bridge_job_credentials(job_id):
     return jsonify({"ok": True, "password": password})
 
 
+@app.route("/internal/cleanup-telegram-only-customers", methods=["POST"])
+def cleanup_telegram_only_customers():
+    """One-time guarded cleanup of users that never received an iChancy Player ID."""
+    if not bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM bridge_jobs
+                WHERE job_type='register_player'
+                  AND (payload->>'telegram_id') IN (
+                    SELECT telegram_id::text FROM users WHERE ichancy_player_id IS NULL
+                  )
+            """)
+            jobs_deleted = cur.rowcount
+            cur.execute("""
+                DELETE FROM users
+                WHERE telegram_id IS NOT NULL
+                  AND ichancy_player_id IS NULL
+                RETURNING telegram_id
+            """)
+            users_deleted = len(cur.fetchall())
+    return jsonify({"ok": True, "users_deleted": users_deleted, "registration_jobs_deleted": jobs_deleted})
+
+
 @app.route("/bridge/status", methods=["GET"])
 def bridge_status():
     if not bridge_authorized(request):
