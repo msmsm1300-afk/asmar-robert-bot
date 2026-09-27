@@ -1799,7 +1799,8 @@ def bridge_next_job():
                     FROM bridge_jobs
                     WHERE job_type='register_player'
                       AND status='failed'
-                      AND error IN ('player_id_not_found_after_registration', 'player_id_recovery_not_found')
+                      AND attempts=1
+                      AND error IN ('player_id_not_found_after_registration', 'player_id_recovery_not_found', 'registration_request_failed')
                     ORDER BY (payload->>'telegram_id'), finished_at DESC
                 )
                 UPDATE bridge_jobs
