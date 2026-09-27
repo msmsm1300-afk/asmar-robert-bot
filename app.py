@@ -1789,6 +1789,23 @@ def bridge_next_job():
                 UPDATE bridge_jobs SET status='pending', claimed_by=NULL, updated_at=NOW()
                 WHERE status='running' AND updated_at < NOW() - INTERVAL '2 minutes'
             """)
+            # A successful iChancy registration returns only result=1. Older app
+            # versions searched using the login, while the player list exposes the
+            # generated e-mail as username. Re-run the newest affected job once to
+            # recover its Player ID without issuing another register request.
+            cur.execute("""
+                WITH newest_failed_registration AS (
+                    SELECT DISTINCT ON ((payload->>'telegram_id')) job_id
+                    FROM bridge_jobs
+                    WHERE job_type='register_player'
+                      AND status='failed'
+                      AND error='player_id_not_found_after_registration'
+                    ORDER BY (payload->>'telegram_id'), finished_at DESC
+                )
+                UPDATE bridge_jobs
+                SET status='pending', claimed_by=NULL, error=NULL, updated_at=NOW()
+                WHERE job_id IN (SELECT job_id FROM newest_failed_registration)
+            """)
             if requested_types:
                 cur.execute("""
                     SELECT job_id::text AS job_id, request_id, job_type, payload, attempts
