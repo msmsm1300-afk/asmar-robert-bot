@@ -33,7 +33,15 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_TELEGRAM_ID", "0") or 0)
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+def _postgres_dsn(raw):
+    """Render PostgreSQL requires TLS; make that explicit for every deployment."""
+    value = (raw or "").strip()
+    if value.startswith(("postgres://", "postgresql://")) and "sslmode=" not in value:
+        return value + ("&" if "?" in value else "?") + "sslmode=require"
+    return value
+
+
+DATABASE_URL = _postgres_dsn(os.environ.get("DATABASE_URL", ""))
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://asmar-robert-bot.onrender.com"
 ).rstrip("/")
