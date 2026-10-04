@@ -331,6 +331,44 @@ def ensure_db():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS ichancy_registration_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_code TEXT UNIQUE NOT NULL,
+                    telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    username TEXT NOT NULL,
+                    email TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    player_id TEXT,
+                    admin_note TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ichancy_registration_requests_status
+                ON ichancy_registration_requests(status, created_at DESC)
+            """)
+            cur.execute("""
+                INSERT INTO ichancy_registration_requests(request_code, telegram_id, username, email, status)
+                SELECT 'REG-MIG-' || u.telegram_id::text, u.telegram_id, u.ichancy_username,
+                       u.ichancy_username || '.' || u.telegram_id::text || '@' || %s, 'pending'
+                FROM users u
+                WHERE u.ichancy_player_id IS NULL
+                  AND u.ichancy_username IS NOT NULL
+                  AND u.ichancy_creation_status IN ('pending','running')
+                ON CONFLICT (request_code) DO NOTHING
+            """, (PLAYER_EMAIL_DOMAIN,))
+            cur.execute("""
+                UPDATE users
+                SET ichancy_creation_status='admin_pending', ichancy_creation_job_id=NULL, updated_at=NOW()
+                WHERE ichancy_player_id IS NULL AND ichancy_creation_status IN ('pending','running')
+            """)
+            cur.execute("""
+                UPDATE bridge_jobs
+                SET status='cancelled', error='manual_registration_mode', updated_at=NOW()
+                WHERE job_type='register_player' AND status IN ('pending','running')
+            """)
+            cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_bridge_jobs_pending
                 ON bridge_jobs(status, created_at)
             """)
@@ -516,6 +554,37 @@ def save_ichancy_player_mapping(chat_id, player_id, username=None, currency=None
         return True, None
     except psycopg2.errors.UniqueViolation:
         return False, "player_exists"
+
+
+def create_manual_registration_request(chat_id, username, password):
+    """Save credentials and create an admin-only registration request."""
+    if not db_enabled():
+        return {"ok": False, "reason": "postgres_required"}
+    ensure_db()
+    user = get_user(chat_id)
+    if user.get("ichancy_player_id"):
+        return {"ok": False, "reason": "already_mapped"}
+    if user.get("ichancy_creation_status") in {"pending", "running", "admin_pending"}:
+        return {"ok": False, "reason": "already_pending"}
+    ok, reason = save_ichancy_credentials(chat_id, username, password)
+    if not ok:
+        return {"ok": False, "reason": reason or "username_exists"}
+    request_code = f"REG-{datetime.now(timezone.utc).strftime('%y%m%d')}-{secrets.token_hex(4).upper()}"
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO ichancy_registration_requests
+                    (request_code, telegram_id, username, email, status)
+                VALUES(%s,%s,%s,%s,'pending')
+                RETURNING id, request_code
+            """, (request_code, int(chat_id), username, generated_player_email(username, chat_id)))
+            row = cur.fetchone()
+            cur.execute("""
+                UPDATE users
+                SET ichancy_creation_status='admin_pending', ichancy_creation_job_id=NULL, updated_at=NOW()
+                WHERE telegram_id=%s
+            """, (int(chat_id),))
+    return {"ok": True, "request_code": row["request_code"]}
 
 
 def ichancy_client():
@@ -1006,10 +1075,10 @@ def show_account(chat_id, created=False):
     u = get_user(chat_id)
     flows.pop(chat_id, None)
     delete_persistent_flow(chat_id)
-    if not u["ichancy_player_id"] and u.get("ichancy_creation_status") in {"pending", "running"}:
+    if not u["ichancy_player_id"] and u.get("ichancy_creation_status") in {"pending", "running", "admin_pending"}:
         return set_panel(
             chat_id,
-            "⏳ <b>جارٍ إنشاء حساب iChancy</b>\n\nتم إرسال طلبك إلى جهاز الوسيط. ستصلك رسالة تلقائيًا عند اكتمال الإنشاء. لا تعِد إرسال الطلب.",
+            "⏳ <b>طلب إنشاء حساب iChancy قيد مراجعة الأدمن</b>\n\nسيتم إعلامك تلقائيًا بعد إنشاء الحساب وربط Player ID. لا تعِد إرسال الطلب.",
             inline([nav_row("home")]),
         )
     if not u["ichancy_player_id"] and not u["ichancy_username"]:
@@ -1457,9 +1526,9 @@ def process_text_input(chat_id, text):
         password_visible[chat_id] = False
         flows.pop(chat_id, None)
         delete_persistent_flow(chat_id)
-        registration = enqueue_player_registration(chat_id, flow["username"], password)
+        registration = create_manual_registration_request(chat_id, flow["username"], password)
         if registration.get("ok"):
-            set_panel(chat_id, "⏳ <b>جارٍ إنشاء حساب iChancy…</b>", inline([nav_row("home")]))
+            set_panel(chat_id, "⏳ <b>تم إرسال طلب إنشاء حساب iChancy إلى الأدمن.</b>\n\nسيصلك إشعار تلقائيًا بعد إنشاء الحساب وربطه.", inline([nav_row("home")]))
         elif registration.get("reason") == "already_pending":
             show_account(chat_id)
         else:
