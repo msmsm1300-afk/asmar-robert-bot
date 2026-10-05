@@ -85,6 +85,7 @@ MIN_TOPUP_USD = Decimal("2")
 MIN_BOT_WITHDRAW = 20_000
 MIN_ICHANCY_DEPOSIT = 20_000
 MIN_ICHANCY_WITHDRAW = 50_000
+ICHANCY_UNITS_PER_BOT_UNIT = 100
 
 # Cash-to-bot conversion: 1 SYP sent = 100 bot balance units.
 SYP_TO_BOT_MULTIPLIER = 100
@@ -1276,11 +1277,13 @@ def show_ichancy_withdraw(chat_id):
             "⚠️ <b>لا يوجد حساب iChancy مرتبط بحسابك.</b>\n\n"
             "أنشئ حساب iChancy أولًا للمتابعة."
         ), inline([[cb("🎮 إنشاء حساب iChancy", "ichancy_create")], nav_row("home")]))
+    flows[chat_id] = {"step": "ichancy_withdraw_amount"}
     return set_panel(chat_id, (
-        "⚠️ <b>الخدمة غير متاحة مؤقتًا</b>\n\n"
-        f"🔻 الحد الأدنى للسحب من iChancy: <b>{fmt_amount(MIN_ICHANCY_WITHDRAW)}</b>\n\n"
-        "يرجى المحاولة بعد قليل."
-    ), inline([nav_row("home")]))
+        "↩️ <b>سحب من حساب iChancy</b>\n\n"
+        f"🔻 الحد الأدنى للسحب: <b>{fmt_amount(MIN_ICHANCY_WITHDRAW)}</b> iChancy\n"
+        "🔁 التحويل: كل 10,000 iChancy = 100 من رصيد البوت\n\n"
+        "أدخل مبلغ iChancy المراد سحبه، ويجب أن يكون من مضاعفات 100."
+    ), inline([nav_row("home", "🔙 إلغاء")]))
 
 
 def show_history(chat_id):
@@ -1672,9 +1675,34 @@ def process_text_input(chat_id, text):
             return True
         set_panel(chat_id, (
             "⏳ <b>جارٍ شحن حساب iChancy</b>\n\n"
-            f"💰 المبلغ: <b>{fmt_amount(amount)}</b>\n"
+            f"💰 من رصيد البوت: <b>{fmt_amount(amount)}</b>\n"
+            f"🎮 إلى iChancy: <b>{fmt_amount(result['ichancy_amount'])}</b>\n"
             f"🧾 رقم الطلب: <code>{html.escape(result['request_id'])}</code>\n\n"
             "تم إرسال الطلب إلى الهاتف الوسيط. لن يُخصم المبلغ من رصيدك إلا بعد تأكيد iChancy للعملية."
+        ), inline([nav_row("home")]))
+        return True
+
+    if step == "ichancy_withdraw_amount":
+        ichancy_amount = parse_amount(text)
+        if ichancy_amount is None:
+            set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا بالأرقام فقط.", inline([nav_row("home", "🔙 إلغاء")]))
+            return True
+        if ichancy_amount < MIN_ICHANCY_WITHDRAW:
+            set_panel(chat_id, f"❌ <b>الحد الأدنى للسحب هو {fmt_amount(MIN_ICHANCY_WITHDRAW)} iChancy</b>", inline([nav_row("home", "🔙 إلغاء")]))
+            return True
+        result = enqueue_ichancy_withdraw(chat_id, ichancy_amount)
+        flows.pop(chat_id, None)
+        if not result.get("ok"):
+            reason = result.get("reason")
+            msg = "⚠️ المبلغ يجب أن يكون من مضاعفات 100." if reason == "invalid_conversion" else "⚠️ تعذر إرسال طلب السحب للجسر."
+            set_panel(chat_id, msg, inline([nav_row("home")]))
+            return True
+        set_panel(chat_id, (
+            "⏳ <b>جارٍ سحب الرصيد من iChancy</b>\n\n"
+            f"🎮 من iChancy: <b>{fmt_amount(result['ichancy_amount'])}</b>\n"
+            f"💰 سيضاف إلى رصيد البوت: <b>{fmt_amount(result['bot_amount'])}</b>\n"
+            f"🧾 رقم الطلب: <code>{html.escape(result['request_id'])}</code>\n\n"
+            "لن تتم إضافة الرصيد إلى البوت إلا بعد تأكيد نجاح العملية من iChancy."
         ), inline([nav_row("home")]))
         return True
 
@@ -1900,10 +1928,12 @@ def enqueue_ichancy_deposit(chat_id, amount):
         return {"ok": False, "reason": "insufficient_balance"}
     currency = str(user.get("ichancy_currency") or "USD").strip() or "USD"
     request_id = f"ichancy-deposit:{chat_id}:{uuid.uuid4()}"
+    ichancy_amount = amount * ICHANCY_UNITS_PER_BOT_UNIT
     payload = {
         "telegram_id": int(chat_id),
         "player_id": player_id,
-        "amount": amount,
+        "amount": ichancy_amount,
+        "bot_amount": amount,
         "currency_code": currency,
         "comment": f"Telegram deposit {chat_id}",
     }
@@ -1911,10 +1941,46 @@ def enqueue_ichancy_deposit(chat_id, amount):
     with db_conn() as conn:
         add_transaction(
             chat_id, "ichancy_deposit", amount, "pending", "bridge",
-            {"request_id": request_id, "job_id": str(job["job_id"]), "player_id": player_id},
+            {"request_id": request_id, "job_id": str(job["job_id"]), "player_id": player_id,
+             "bot_amount": amount, "ichancy_amount": ichancy_amount,
+             "conversion_rate": ICHANCY_UNITS_PER_BOT_UNIT},
             None, None, conn=conn,
         )
-    return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id}
+    return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id,
+            "bot_amount": amount, "ichancy_amount": ichancy_amount}
+
+
+def enqueue_ichancy_withdraw(chat_id, ichancy_amount):
+    """Queue an iChancy withdrawal; credit the bot only after bridge confirmation."""
+    if not db_enabled():
+        return {"ok": False, "reason": "postgres_required"}
+    ensure_db()
+    user = get_user(chat_id)
+    player_id = str(user.get("ichancy_player_id") or "").strip()
+    if not player_id:
+        return {"ok": False, "reason": "player_not_mapped"}
+    ichancy_amount = int(ichancy_amount)
+    if ichancy_amount <= 0 or ichancy_amount % ICHANCY_UNITS_PER_BOT_UNIT:
+        return {"ok": False, "reason": "invalid_conversion"}
+    bot_amount = ichancy_amount // ICHANCY_UNITS_PER_BOT_UNIT
+    currency = str(user.get("ichancy_currency") or "USD").strip() or "USD"
+    request_id = f"ichancy-withdraw:{chat_id}:{uuid.uuid4()}"
+    payload = {
+        "telegram_id": int(chat_id), "player_id": player_id,
+        "amount": ichancy_amount, "bot_amount": bot_amount,
+        "currency_code": currency, "comment": f"Telegram withdrawal {chat_id}",
+    }
+    job = enqueue_bridge_job(request_id, "withdraw", payload)
+    with db_conn() as conn:
+        add_transaction(
+            chat_id, "ichancy_withdraw", bot_amount, "pending", "bridge",
+            {"request_id": request_id, "job_id": str(job["job_id"]),
+             "player_id": player_id, "ichancy_amount": ichancy_amount,
+             "bot_amount": bot_amount, "conversion_rate": ICHANCY_UNITS_PER_BOT_UNIT},
+            None, None, conn=conn,
+        )
+    return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id,
+            "bot_amount": bot_amount, "ichancy_amount": ichancy_amount}
 
 
 @app.route("/bridge/v1/heartbeat", methods=["POST"])
@@ -2081,7 +2147,7 @@ def bridge_complete_job(job_id):
             if accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
                 payload = completed_job.get("payload") or {}
                 telegram_id = payload.get("telegram_id")
-                amount = int(payload.get("amount") or 0)
+                amount = int(payload.get("bot_amount") or 0)
                 if telegram_id and status == "succeeded" and amount > 0:
                     cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (int(telegram_id),))
                     user = cur.fetchone()
@@ -2106,6 +2172,27 @@ def bridge_complete_job(job_id):
                     cur.execute("""
                         UPDATE transactions SET status='failed'
                         WHERE telegram_id=%s AND tx_type='ichancy_deposit'
+                          AND details->>'job_id'=%s AND status='pending'
+                        """, (int(telegram_id), str(job_id)))
+            if accepted_completion and completed_job and completed_job.get("job_type") == "withdraw":
+                payload = completed_job.get("payload") or {}
+                telegram_id = payload.get("telegram_id")
+                amount = int(payload.get("bot_amount") or 0)
+                if telegram_id and status == "succeeded" and amount > 0:
+                    cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (int(telegram_id),))
+                    user = cur.fetchone()
+                    before = int(user["balance"] or 0) if user else 0
+                    after = before + amount
+                    cur.execute("UPDATE users SET balance=%s,updated_at=NOW() WHERE telegram_id=%s", (after, int(telegram_id)))
+                    cur.execute("""
+                        UPDATE transactions SET status='completed', balance_before=%s, balance_after=%s
+                        WHERE telegram_id=%s AND tx_type='ichancy_withdraw'
+                          AND details->>'job_id'=%s AND status='pending'
+                    """, (before, after, int(telegram_id), str(job_id)))
+                elif telegram_id:
+                    cur.execute("""
+                        UPDATE transactions SET status='failed'
+                        WHERE telegram_id=%s AND tx_type='ichancy_withdraw'
                           AND details->>'job_id'=%s AND status='pending'
                     """, (int(telegram_id), str(job_id)))
     if accepted_completion and completed_job and completed_job.get("job_type") == "register_player":
@@ -2137,6 +2224,14 @@ def bridge_complete_job(job_id):
         elif chat_id:
             error = html.escape(str(body.get("error") or "تعذر تنفيذ العملية")[:180])
             set_panel(int(chat_id), f"⚠️ <b>لم يكتمل شحن حساب iChancy</b>\n\nالسبب: <code>{error}</code>\n\nلم يتم خصم المبلغ من رصيدك.", inline([nav_row("home")]))
+    elif accepted_completion and completed_job and completed_job.get("job_type") == "withdraw":
+        payload = completed_job.get("payload") or {}
+        chat_id = payload.get("telegram_id")
+        if chat_id and status == "succeeded":
+            set_panel(int(chat_id), "✅ <b>تم سحب الرصيد من iChancy بنجاح</b>\n\nتم تأكيد العملية وإضافة الرصيد المحول إلى رصيد البوت.", inline([nav_row("home")]))
+        elif chat_id:
+            error = html.escape(str(body.get("error") or "تعذر تنفيذ العملية")[:180])
+            set_panel(int(chat_id), f"⚠️ <b>لم يكتمل سحب iChancy</b>\n\nالسبب: <code>{error}</code>\n\nلم تتم إضافة أي رصيد إلى البوت.", inline([nav_row("home")]))
     return jsonify({"ok": True, "job": dict(row)})
 
 
