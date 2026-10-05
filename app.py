@@ -83,8 +83,8 @@ DEFAULT_BONUSES = {
 MIN_TOPUP_SYP = 200
 MIN_TOPUP_USD = Decimal("2")
 MIN_BOT_WITHDRAW = 20_000
-MIN_ICHANCY_DEPOSIT = 20_000
-MIN_ICHANCY_WITHDRAW = 50_000
+MIN_ICHANCY_DEPOSIT = 100
+MIN_ICHANCY_WITHDRAW = 10_000
 ICHANCY_UNITS_PER_BOT_UNIT = 100
 
 # Cash-to-bot conversion: 1 SYP sent = 100 bot balance units.
@@ -1265,7 +1265,8 @@ def show_ichancy_deposit(chat_id):
     return set_panel(chat_id, (
         "🎮 <b>شحن حساب iChancy</b>\n\n"
         f"💰 رصيدك المتاح: <b>{fmt_amount(u['balance'])}</b>\n"
-        f"🔻 الحد الأدنى للشحن: <b>{fmt_amount(MIN_ICHANCY_DEPOSIT)}</b>\n\n"
+        f"🔻 الحد الأدنى للشحن: <b>{fmt_amount(MIN_ICHANCY_DEPOSIT)}</b> من رصيد البوت = <b>{fmt_amount(MIN_ICHANCY_DEPOSIT * ICHANCY_UNITS_PER_BOT_UNIT)}</b> iChancy\n"
+        "🔁 كل 100 من رصيد البوت = 10,000 iChancy\n\n"
         "أدخل المبلغ الذي ترغب بإضافته إلى حسابك."
     ), inline([nav_row("home", "🔙 إلغاء")]))
 
