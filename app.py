@@ -79,8 +79,8 @@ DEFAULT_BONUSES = {
     "wish": 0,
 }
 
-# Transaction minimums agreed for the customer bot.
-MIN_TOPUP_SYP = 20_000
+# Cash minimums: 200 SYP cash becomes 20,000 bot units (1:100).
+MIN_TOPUP_SYP = 200
 MIN_TOPUP_USD = Decimal("2")
 MIN_BOT_WITHDRAW = 20_000
 MIN_ICHANCY_DEPOSIT = 20_000
