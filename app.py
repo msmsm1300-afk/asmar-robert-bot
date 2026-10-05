@@ -1659,7 +1659,23 @@ def process_text_input(chat_id, text):
                 f"المبلغ المطلوب: <b>{fmt_amount(amount)}</b>"
             ), inline([nav_row("home")]))
             return True
-        set_panel(chat_id, "🧪 <b>الواجهة جاهزة للاختبار</b>\n\nلم يتم إرسال أي مبلغ إلى iChancy لأن الجسر لم يتم ربطه بعد.", inline([nav_row("home")]))
+        result = enqueue_ichancy_deposit(chat_id, amount)
+        if not result.get("ok"):
+            reason = result.get("reason")
+            if reason == "player_not_mapped":
+                msg = "⚠️ <b>حساب iChancy غير مربوط بعد.</b>\n\nأنشئ الحساب واربط Player ID أولًا."
+            elif reason == "insufficient_balance":
+                msg = "⚠️ <b>الرصيد غير كافٍ.</b>\n\nتعذر حجز طلب الشحن من رصيدك الحالي."
+            else:
+                msg = "⚠️ <b>تعذر إرسال طلب الشحن للجسر.</b>\n\nحاول مرة أخرى بعد قليل."
+            set_panel(chat_id, msg, inline([nav_row("home")]))
+            return True
+        set_panel(chat_id, (
+            "⏳ <b>جارٍ شحن حساب iChancy</b>\n\n"
+            f"💰 المبلغ: <b>{fmt_amount(amount)}</b>\n"
+            f"🧾 رقم الطلب: <code>{html.escape(result['request_id'])}</code>\n\n"
+            "تم إرسال الطلب إلى الهاتف الوسيط. لن يُخصم المبلغ من رصيدك إلا بعد تأكيد iChancy للعملية."
+        ), inline([nav_row("home")]))
         return True
 
     if step == "gift_code":
@@ -1870,6 +1886,37 @@ def enqueue_player_registration(chat_id, username, password):
     return {"ok": True, "job_id": str(job["job_id"])}
 
 
+def enqueue_ichancy_deposit(chat_id, amount):
+    """Queue an idempotent iChancy deposit for the authenticated phone Bridge."""
+    if not db_enabled():
+        return {"ok": False, "reason": "postgres_required"}
+    ensure_db()
+    user = get_user(chat_id)
+    player_id = str(user.get("ichancy_player_id") or "").strip()
+    if not player_id:
+        return {"ok": False, "reason": "player_not_mapped"}
+    amount = int(amount)
+    if amount <= 0 or amount > int(user.get("balance") or 0):
+        return {"ok": False, "reason": "insufficient_balance"}
+    currency = str(user.get("ichancy_currency") or "USD").strip() or "USD"
+    request_id = f"ichancy-deposit:{chat_id}:{uuid.uuid4()}"
+    payload = {
+        "telegram_id": int(chat_id),
+        "player_id": player_id,
+        "amount": amount,
+        "currency_code": currency,
+        "comment": f"Telegram deposit {chat_id}",
+    }
+    job = enqueue_bridge_job(request_id, "deposit", payload)
+    with db_conn() as conn:
+        add_transaction(
+            chat_id, "ichancy_deposit", amount, "pending", "bridge",
+            {"request_id": request_id, "job_id": str(job["job_id"]), "player_id": player_id},
+            None, None, conn=conn,
+        )
+    return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id}
+
+
 @app.route("/bridge/v1/heartbeat", methods=["POST"])
 def bridge_heartbeat():
     if not bridge_authorized(request):
@@ -2031,6 +2078,36 @@ def bridge_complete_job(job_id):
                         SET ichancy_creation_status='failed', updated_at=NOW()
                         WHERE telegram_id=%s
                     """, (int(telegram_id),))
+            if accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
+                payload = completed_job.get("payload") or {}
+                telegram_id = payload.get("telegram_id")
+                amount = int(payload.get("amount") or 0)
+                if telegram_id and status == "succeeded" and amount > 0:
+                    cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (int(telegram_id),))
+                    user = cur.fetchone()
+                    if not user or int(user.get("balance") or 0) < amount:
+                        status = "failed"
+                        cur.execute("UPDATE bridge_jobs SET status='failed', error=%s WHERE job_id=%s", ("insufficient_balance_after_confirmation", job_id))
+                        cur.execute("""
+                            UPDATE transactions SET status='failed'
+                            WHERE telegram_id=%s AND tx_type='ichancy_deposit'
+                              AND details->>'job_id'=%s AND status='pending'
+                        """, (int(telegram_id), str(job_id)))
+                    else:
+                        before = int(user["balance"] or 0)
+                        after = before - amount
+                        cur.execute("UPDATE users SET balance=%s,updated_at=NOW() WHERE telegram_id=%s", (after, int(telegram_id)))
+                        cur.execute("""
+                            UPDATE transactions SET status='completed', balance_before=%s, balance_after=%s
+                            WHERE telegram_id=%s AND tx_type='ichancy_deposit'
+                              AND details->>'job_id'=%s AND status='pending'
+                        """, (before, after, int(telegram_id), str(job_id)))
+                elif telegram_id:
+                    cur.execute("""
+                        UPDATE transactions SET status='failed'
+                        WHERE telegram_id=%s AND tx_type='ichancy_deposit'
+                          AND details->>'job_id'=%s AND status='pending'
+                    """, (int(telegram_id), str(job_id)))
     if accepted_completion and completed_job and completed_job.get("job_type") == "register_player":
         payload = completed_job.get("payload") or {}
         chat_id = payload.get("telegram_id")
@@ -2052,6 +2129,14 @@ def bridge_complete_job(job_id):
             else:
                 message = "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا."
             set_panel(int(chat_id), message, inline([[cb("🔁 اختيار اسم آخر", "ichancy_create")], nav_row("account")]))
+    elif accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
+        payload = completed_job.get("payload") or {}
+        chat_id = payload.get("telegram_id")
+        if chat_id and status == "succeeded":
+            set_panel(int(chat_id), "✅ <b>تم شحن حساب iChancy بنجاح</b>\n\nتم تأكيد العملية من iChancy وخصم المبلغ من رصيدك.", inline([nav_row("home")]))
+        elif chat_id:
+            error = html.escape(str(body.get("error") or "تعذر تنفيذ العملية")[:180])
+            set_panel(int(chat_id), f"⚠️ <b>لم يكتمل شحن حساب iChancy</b>\n\nالسبب: <code>{error}</code>\n\nلم يتم خصم المبلغ من رصيدك.", inline([nav_row("home")]))
     return jsonify({"ok": True, "job": dict(row)})
 
 
