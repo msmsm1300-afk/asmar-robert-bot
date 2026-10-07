@@ -1079,7 +1079,7 @@ def show_account(chat_id, created=False):
     if not u["ichancy_player_id"] and u.get("ichancy_creation_status") in {"pending", "running", "admin_pending"}:
         return set_panel(
             chat_id,
-            "⏳ <b>طلب إنشاء حساب iChancy قيد مراجعة الأدمن</b>\n\nسيتم إعلامك تلقائيًا بعد إنشاء الحساب وربط Player ID. لا تعِد إرسال الطلب.",
+            "⏳ <b>جاري إنشاء حسابك في iChancy…</b>\n\nيرجى الانتظار قليلًا، وسيصلك إشعار تلقائيًا عند اكتمال الحساب.",
             inline([nav_row("home")]),
         )
     if not u["ichancy_player_id"] and not u["ichancy_username"]:
@@ -1532,7 +1532,7 @@ def process_text_input(chat_id, text):
         delete_persistent_flow(chat_id)
         registration = create_manual_registration_request(chat_id, flow["username"], password)
         if registration.get("ok"):
-            set_panel(chat_id, "⏳ <b>تم إرسال طلب إنشاء حساب iChancy إلى الأدمن.</b>\n\nسيصلك إشعار تلقائيًا بعد إنشاء الحساب وربطه.", inline([nav_row("home")]))
+            set_panel(chat_id, "⏳ <b>جاري إنشاء حسابك في iChancy…</b>\n\nيرجى الانتظار قليلًا، وسيصلك إشعار تلقائيًا عند اكتمال الحساب.", inline([nav_row("home")]))
         elif registration.get("reason") == "already_pending":
             show_account(chat_id)
         else:
