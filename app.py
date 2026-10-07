@@ -1100,13 +1100,7 @@ def show_account(chat_id, created=False):
     shown = html.escape(pwd) if u.get("password_visible") else "••••••••"
     username = html.escape(u["ichancy_username"] or "غير متاح")
     title = "✅ <b>تم إنشاء حسابك بنجاح</b>" if created else "🔐 <b>بيانات تسجيل الدخول للحساب</b>"
-    balance_line = ""
-    if u.get("ichancy_player_id"):
-        balance = fetch_ichancy_balance(chat_id)
-        if balance.get("ok"):
-            balance_line = f"\n💰 الرصيد الحقيقي: <b>{html.escape(str(balance['balance']))} {html.escape(str(balance.get('currency') or ''))}</b>\n"
-        else:
-            balance_line = "\n💰 الرصيد الحقيقي: <i>تعذر جلبه حاليًا، حاول لاحقًا</i>\n"
+    balance_line = "\n💰 الرصيد الحقيقي: <i>اضغط «تحديث الرصيد» لجلبه من iChancy</i>\n"
     text = (
         f"{title}\n\n"
         f"👤 اسم المستخدم: <code>{username}</code>\n"
@@ -1119,6 +1113,7 @@ def show_account(chat_id, created=False):
         [copy_btn("📋 نسخ اسم المستخدم", u["ichancy_username"])],
         [cb(toggle, "ichancy_toggle_password")],
         [copy_btn("📋 نسخ كلمة المرور", pwd)],
+        [cb("🔄 تحديث الرصيد", "ichancy_balance")],
         [url_btn("🌐 الدخول إلى iChancy", "https://www.ichancy200.com")],
         nav_row("home"),
     ]))
@@ -1530,7 +1525,7 @@ def process_text_input(chat_id, text):
         password_visible[chat_id] = False
         flows.pop(chat_id, None)
         delete_persistent_flow(chat_id)
-        registration = create_manual_registration_request(chat_id, flow["username"], password)
+        registration = enqueue_player_registration(chat_id, flow["username"], password)
         if registration.get("ok"):
             set_panel(chat_id, "⏳ <b>جاري إنشاء حسابك في iChancy…</b>\n\nيرجى الانتظار قليلًا، وسيصلك إشعار تلقائيًا عند اكتمال الحساب.", inline([nav_row("home")]))
         elif registration.get("reason") == "already_pending":
@@ -1822,6 +1817,12 @@ def handle_callback(query):
         show_ichancy_deposit(chat_id)
     elif data == "ichancy_withdraw":
         show_ichancy_withdraw(chat_id)
+    elif data == "ichancy_balance":
+        result = enqueue_ichancy_balance(chat_id)
+        if result.get("ok"):
+            set_panel(chat_id, "⏳ <b>جارٍ تحديث الرصيد من iChancy…</b>\n\nستصلك النتيجة تلقائيًا بعد تأكيد الجسر.", inline([nav_row("account")]))
+        else:
+            set_panel(chat_id, "⚠️ <b>تعذر طلب الرصيد حاليًا.</b>\n\nتأكد من ربط حساب iChancy ثم أعد المحاولة.", inline([nav_row("account")]))
     elif data == "history":
         show_history(chat_id)
     elif data.startswith("history:"):
@@ -1949,6 +1950,23 @@ def enqueue_ichancy_deposit(chat_id, amount):
         )
     return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id,
             "bot_amount": amount, "ichancy_amount": ichancy_amount}
+
+
+def enqueue_ichancy_balance(chat_id):
+    """Queue a read-only balance request for the phone Bridge."""
+    if not db_enabled():
+        return {"ok": False, "reason": "postgres_required"}
+    ensure_db()
+    user = get_user(chat_id)
+    player_id = str(user.get("ichancy_player_id") or "").strip()
+    if not player_id:
+        return {"ok": False, "reason": "player_not_mapped"}
+    request_id = f"ichancy-balance:{chat_id}:{uuid.uuid4()}"
+    job = enqueue_bridge_job(request_id, "get_balance", {
+        "telegram_id": int(chat_id), "player_id": player_id,
+        "currency_code": str(user.get("ichancy_currency") or "USD"),
+    })
+    return {"ok": True, "job_id": str(job["job_id"])}
 
 
 def enqueue_ichancy_withdraw(chat_id, ichancy_amount):
@@ -2145,6 +2163,9 @@ def bridge_complete_job(job_id):
                         SET ichancy_creation_status='failed', updated_at=NOW()
                         WHERE telegram_id=%s
                     """, (int(telegram_id),))
+            if accepted_completion and completed_job and completed_job.get("job_type") == "get_balance":
+                # Read-only result: never mutate the bot balance or financial ledger.
+                pass
             if accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
                 payload = completed_job.get("payload") or {}
                 telegram_id = payload.get("telegram_id")
@@ -2217,6 +2238,17 @@ def bridge_complete_job(job_id):
             else:
                 message = "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا."
             set_panel(int(chat_id), message, inline([[cb("🔁 اختيار اسم آخر", "ichancy_create")], nav_row("account")]))
+    elif accepted_completion and completed_job and completed_job.get("job_type") == "get_balance":
+        payload = completed_job.get("payload") or {}
+        chat_id = payload.get("telegram_id")
+        result = completed_job.get("result") or {}
+        if chat_id and status == "succeeded":
+            balance = html.escape(str(result.get("balance", "غير متاح")))
+            currency = html.escape(str(result.get("currency") or payload.get("currency_code") or ""))
+            set_panel(int(chat_id), f"✅ <b>تم تحديث الرصيد من iChancy</b>\n\n💰 الرصيد الحالي: <b>{balance} {currency}</b>", inline([nav_row("account")]))
+        elif chat_id:
+            error = html.escape(str(body.get("error") or "تعذر جلب الرصيد")[:180])
+            set_panel(int(chat_id), f"⚠️ <b>تعذر تحديث الرصيد</b>\n\nالسبب: <code>{error}</code>", inline([nav_row("account")]))
     elif accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
         payload = completed_job.get("payload") or {}
         chat_id = payload.get("telegram_id")
