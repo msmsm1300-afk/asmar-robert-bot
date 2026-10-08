@@ -47,6 +47,9 @@ PUBLIC_BASE_URL = os.environ.get(
 ).rstrip("/")
 BRIDGE_SHARED_SECRET = os.environ.get("BRIDGE_SHARED_SECRET", "").strip()
 PLAYER_EMAIL_DOMAIN = os.environ.get("ICHANCY_PLAYER_EMAIL_DOMAIN", "asmarrobert.example").strip().lower()
+REGISTRATION_MODE = os.environ.get("ICHANCY_REGISTRATION_MODE", "auto").strip().lower()
+if REGISTRATION_MODE not in {"auto", "manual"}:
+    REGISTRATION_MODE = "auto"
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
@@ -360,19 +363,45 @@ def ensure_db():
                 ON CONFLICT (request_code) DO NOTHING
             """, (PLAYER_EMAIL_DOMAIN,))
             cur.execute("""
-                UPDATE users
-                SET ichancy_creation_status='admin_pending', ichancy_creation_job_id=NULL, updated_at=NOW()
-                WHERE ichancy_player_id IS NULL AND ichancy_creation_status IN ('pending','running')
-            """)
-            cur.execute("""
-                UPDATE bridge_jobs
-                SET status='cancelled', error='manual_registration_mode', updated_at=NOW()
-                WHERE job_type='register_player' AND status IN ('pending','running')
-            """)
-            cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_bridge_jobs_pending
                 ON bridge_jobs(status, created_at)
             """)
+            if REGISTRATION_MODE == "auto":
+                # Legacy deployments cancelled registration Jobs while forcing
+                # manual mode. Mark only those known legacy requests as failed;
+                # never recreate or requeue them automatically.
+                cur.execute("""
+                    UPDATE ichancy_registration_requests r
+                    SET status='cancelled',
+                        admin_note='legacy_manual_registration_mode',
+                        updated_at=NOW()
+                    WHERE r.status IN ('pending','queued','running')
+                      AND EXISTS (
+                          SELECT 1
+                          FROM bridge_jobs j
+                          WHERE j.job_type='register_player'
+                            AND j.status='cancelled'
+                            AND j.error='manual_registration_mode'
+                            AND (j.payload->>'telegram_id')::bigint=r.telegram_id
+                            AND LOWER(j.payload->>'username')=LOWER(r.username)
+                      )
+                """)
+                cur.execute("""
+                    UPDATE users u
+                    SET ichancy_creation_status='failed',
+                        ichancy_creation_job_id=NULL,
+                        updated_at=NOW()
+                    WHERE u.ichancy_player_id IS NULL
+                      AND u.ichancy_creation_status='admin_pending'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM bridge_jobs j
+                          WHERE j.job_type='register_player'
+                            AND j.status='cancelled'
+                            AND j.error='manual_registration_mode'
+                            AND (j.payload->>'telegram_id')::bigint=u.telegram_id
+                      )
+                """)
             for method, percent in DEFAULT_BONUSES.items():
                 cur.execute(
                     "INSERT INTO bonuses(method, percent) VALUES(%s, %s) ON CONFLICT(method) DO NOTHING",
@@ -586,6 +615,30 @@ def create_manual_registration_request(chat_id, username, password):
                 WHERE telegram_id=%s
             """, (int(chat_id),))
     return {"ok": True, "request_code": row["request_code"]}
+
+
+def registration_mode():
+    """Return the explicitly configured registration mode.
+
+    Automatic Bridge registration is the safe default. The old implementation
+    silently forced manual mode from ensure_db(), which cancelled live Jobs.
+    """
+    return REGISTRATION_MODE
+
+
+def registration_status_message(status):
+    """Customer-safe status text for the registration state machine."""
+    if status == "admin_pending":
+        return (
+            "🕒 <b>تم استلام طلب إنشاء الحساب</b>\n\n"
+            "الطلب بانتظار إجراء إداري، وستصلك رسالة عند اكتماله."
+        )
+    if status in {"pending", "running"}:
+        return (
+            "⏳ <b>جاري إنشاء حسابك في iChancy…</b>\n\n"
+            "يرجى الانتظار قليلًا، وستصلك النتيجة تلقائيًا."
+        )
+    return ""
 
 
 def ichancy_client():
@@ -1079,7 +1132,7 @@ def show_account(chat_id, created=False):
     if not u["ichancy_player_id"] and u.get("ichancy_creation_status") in {"pending", "running", "admin_pending"}:
         return set_panel(
             chat_id,
-            "⏳ <b>جاري إنشاء حسابك في iChancy…</b>\n\nيرجى الانتظار قليلًا، وسيصلك إشعار تلقائيًا عند اكتمال الحساب.",
+            registration_status_message(u.get("ichancy_creation_status")),
             inline([nav_row("home")]),
         )
     if not u["ichancy_player_id"] and not u["ichancy_username"]:
@@ -1525,9 +1578,15 @@ def process_text_input(chat_id, text):
         password_visible[chat_id] = False
         flows.pop(chat_id, None)
         delete_persistent_flow(chat_id)
-        registration = enqueue_player_registration(chat_id, flow["username"], password)
+        if registration_mode() == "manual":
+            registration = create_manual_registration_request(chat_id, flow["username"], password)
+        else:
+            registration = enqueue_player_registration(chat_id, flow["username"], password)
         if registration.get("ok"):
-            set_panel(chat_id, "⏳ <b>جاري إنشاء حسابك في iChancy…</b>\n\nيرجى الانتظار قليلًا، وسيصلك إشعار تلقائيًا عند اكتمال الحساب.", inline([nav_row("home")]))
+            if registration_mode() == "manual":
+                set_panel(chat_id, registration_status_message("admin_pending"), inline([nav_row("home")]))
+            else:
+                set_panel(chat_id, registration_status_message("pending"), inline([nav_row("home")]))
         elif registration.get("reason") == "already_pending":
             show_account(chat_id)
         else:
@@ -1913,6 +1972,25 @@ def enqueue_player_registration(chat_id, username, password):
                     updated_at=NOW()
                 WHERE telegram_id=%s
             """, (str(job["job_id"]), chat_id))
+            cur.execute("""
+                UPDATE ichancy_registration_requests
+                SET status='queued', admin_note=NULL, updated_at=NOW()
+                WHERE id = (
+                    SELECT id FROM ichancy_registration_requests
+                    WHERE telegram_id=%s AND LOWER(username)=LOWER(%s)
+                    ORDER BY created_at DESC LIMIT 1
+                )
+            """, (int(chat_id), username))
+            if cur.rowcount == 0:
+                cur.execute("""
+                    INSERT INTO ichancy_registration_requests
+                        (request_code, telegram_id, username, email, status)
+                    VALUES(%s,%s,%s,%s,'queued')
+                    ON CONFLICT (request_code) DO NOTHING
+                """, (
+                    f"JOB-{str(job['job_id'])}", int(chat_id), username,
+                    payload["email"],
+                ))
     return {"ok": True, "job_id": str(job["job_id"])}
 
 
@@ -2063,6 +2141,18 @@ def bridge_next_job():
                 UPDATE bridge_jobs SET status='pending', claimed_by=NULL, updated_at=NOW()
                 WHERE status='running' AND updated_at < NOW() - INTERVAL '2 minutes'
             """)
+            cur.execute("""
+                UPDATE ichancy_registration_requests r
+                SET status='queued', updated_at=NOW()
+                WHERE r.status='running'
+                  AND EXISTS (
+                      SELECT 1 FROM bridge_jobs j
+                      WHERE j.job_type='register_player'
+                        AND j.status='pending'
+                        AND (j.payload->>'telegram_id')::bigint=r.telegram_id
+                        AND LOWER(j.payload->>'username')=LOWER(r.username)
+                  )
+            """)
             # A successful iChancy registration returns only result=1. Older app
             # versions searched using the login, while the player list exposes the
             # generated e-mail as username. Re-run the newest affected job once to
@@ -2108,6 +2198,17 @@ def bridge_next_job():
                     started_at=COALESCE(started_at,NOW()), updated_at=NOW()
                 WHERE job_id=%s
             """, (device_id, row["job_id"]))
+            if row["job_type"] == "register_player":
+                payload = row.get("payload") or {}
+                cur.execute("""
+                    UPDATE ichancy_registration_requests
+                    SET status='running', updated_at=NOW()
+                    WHERE id = (
+                        SELECT id FROM ichancy_registration_requests
+                        WHERE telegram_id=%s AND LOWER(username)=LOWER(%s)
+                        ORDER BY created_at DESC LIMIT 1
+                    )
+                """, (payload.get("telegram_id"), payload.get("username", "")))
     return jsonify({"ok": True, "job": dict(row)})
 
 
@@ -2157,12 +2258,24 @@ def bridge_complete_job(job_id):
                             updated_at=NOW()
                         WHERE telegram_id=%s
                     """, (player_id, payload.get("username"), result.get("currency"), int(telegram_id)))
+                    cur.execute("""
+                        UPDATE ichancy_registration_requests
+                        SET status='succeeded', player_id=%s, admin_note=NULL, updated_at=NOW()
+                        WHERE telegram_id=%s AND LOWER(username)=LOWER(%s)
+                          AND status IN ('queued','running','pending')
+                    """, (player_id, int(telegram_id), payload.get("username", "")))
                 elif telegram_id:
                     cur.execute("""
                         UPDATE users
                         SET ichancy_creation_status='failed', updated_at=NOW()
                         WHERE telegram_id=%s
                     """, (int(telegram_id),))
+                    cur.execute("""
+                        UPDATE ichancy_registration_requests
+                        SET status='failed', admin_note=%s, updated_at=NOW()
+                        WHERE telegram_id=%s AND LOWER(username)=LOWER(%s)
+                          AND status IN ('queued','running','pending')
+                    """, (str(body.get("error") or "registration_failed")[:240], int(telegram_id), payload.get("username", "")))
             if accepted_completion and completed_job and completed_job.get("job_type") == "get_balance":
                 # Read-only result: never mutate the bot balance or financial ledger.
                 pass
