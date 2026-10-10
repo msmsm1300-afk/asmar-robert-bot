@@ -54,11 +54,11 @@ class DynamicCalculationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"disabled_field:{key}"):
                     validate_dynamic_fields({key: "disabled"}, {key: "provided"})
 
-    def test_legacy_ichancy_conversion_is_centralized_and_single(self):
-        self.assertEqual(ichancy_deposit_units(200), 20000)
-        self.assertEqual(ichancy_withdraw_bot_units(20000), 200)
+    def test_ichancy_conversion_is_one_to_one_and_does_not_use_cash_multiplier(self):
+        self.assertEqual(ichancy_deposit_units(200), 200)
+        self.assertEqual(ichancy_withdraw_bot_units(200), 200)
         with self.assertRaises(ValueError):
-            ichancy_withdraw_bot_units(20001)
+            ichancy_withdraw_bot_units(0)
 
 
 if __name__ == "__main__":

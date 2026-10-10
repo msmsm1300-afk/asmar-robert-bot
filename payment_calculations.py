@@ -2,7 +2,9 @@
 from decimal import Decimal, ROUND_FLOOR
 import re
 
-ICHANCY_CONVERSION_MULTIPLIER = Decimal("100")
+# iChancy transfers are denominated 1:1 with the bot balance.
+# Cash payment methods use their own snapshot conversion_multiplier.
+ICHANCY_CONVERSION_MULTIPLIER = Decimal("1")
 
 
 def normalize_operation_reference(value):

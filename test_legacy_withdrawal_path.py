@@ -209,7 +209,7 @@ class LegacyWithdrawalPathTests(unittest.TestCase):
                 cur.execute("SELECT status FROM balance_reservations WHERE cash_request_id=%s", (payload["cash_request_id"],))
                 self.assertEqual(cur.fetchone()["status"], "settled")
                 cur.execute("SELECT balance,reserved_balance FROM users WHERE telegram_id=%s", (LOCAL_CHAT_ID,))
-                self.assertEqual(dict(cur.fetchone()), {"balance": 49800, "reserved_balance": 0})
+                self.assertEqual(dict(cur.fetchone()), {"balance": 30000, "reserved_balance": 0})
 
     def test_claim_before_admin_approval_is_rejected_without_claiming_job(self):
         queued = app.enqueue_ichancy_withdraw(LOCAL_CHAT_ID, 20000, "claim-before-approval")
@@ -230,7 +230,7 @@ class LegacyWithdrawalPathTests(unittest.TestCase):
                 cur.execute("SELECT status FROM cash_requests WHERE details->>'job_id'=%s", (queued["job_id"],))
                 self.assertEqual(cur.fetchone()["status"], "funds_reserved")
                 cur.execute("SELECT balance,reserved_balance FROM users WHERE telegram_id=%s", (LOCAL_CHAT_ID,))
-                self.assertEqual(dict(cur.fetchone()), {"balance": 50000, "reserved_balance": 200})
+                self.assertEqual(dict(cur.fetchone()), {"balance": 50000, "reserved_balance": 20000})
 
     def test_duplicate_completion_and_external_success_are_idempotent_over_http(self):
         queued, cash_request_id = self._approved_withdrawal("duplicate-completion")
@@ -251,7 +251,7 @@ class LegacyWithdrawalPathTests(unittest.TestCase):
                 cur.execute("SELECT status FROM balance_reservations WHERE cash_request_id=%s", (cash_request_id,))
                 self.assertEqual(cur.fetchone()["status"], "settled")
                 cur.execute("SELECT balance,reserved_balance FROM users WHERE telegram_id=%s", (LOCAL_CHAT_ID,))
-                self.assertEqual(dict(cur.fetchone()), {"balance": 49800, "reserved_balance": 0})
+                self.assertEqual(dict(cur.fetchone()), {"balance": 30000, "reserved_balance": 0})
                 cur.execute("SELECT COUNT(*) AS count FROM transactions WHERE details->>'job_id'=%s", (queued["job_id"],))
                 self.assertEqual(cur.fetchone()["count"], 1)
                 cur.execute("SELECT COUNT(*) AS count FROM financial_reconciliations WHERE cash_request_id=%s", (cash_request_id,))
@@ -293,7 +293,7 @@ class LegacyWithdrawalPathTests(unittest.TestCase):
                 cur.execute("SELECT status FROM balance_reservations WHERE cash_request_id=%s", (cash_request_id,))
                 self.assertEqual(cur.fetchone()["status"], "unknown_external_result")
                 cur.execute("SELECT balance,reserved_balance FROM users WHERE telegram_id=%s", (LOCAL_CHAT_ID,))
-                self.assertEqual(dict(cur.fetchone()), {"balance": 50000, "reserved_balance": 200})
+                self.assertEqual(dict(cur.fetchone()), {"balance": 50000, "reserved_balance": 20000})
                 cur.execute("SELECT COUNT(*) AS count FROM financial_reconciliations WHERE cash_request_id=%s", (cash_request_id,))
                 self.assertEqual(cur.fetchone()["count"], 1)
 

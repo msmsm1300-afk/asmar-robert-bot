@@ -114,7 +114,8 @@ MIN_TOPUP_USD = Decimal("2")
 MIN_BOT_WITHDRAW = 20_000
 MIN_ICHANCY_DEPOSIT = 100
 MIN_ICHANCY_WITHDRAW = 10_000
-ICHANCY_UNITS_PER_BOT_UNIT = 100
+# iChancy transfers use a 1:1 unit ratio; cash methods keep their own multiplier.
+ICHANCY_UNITS_PER_BOT_UNIT = 1
 
 # Cash-to-bot conversion: 1 SYP sent = 100 bot balance units.
 SYP_TO_BOT_MULTIPLIER = 100
@@ -1561,7 +1562,7 @@ def show_ichancy_deposit(chat_id):
         "🎮 <b>شحن حساب iChancy</b>\n\n"
         f"💰 رصيدك المتاح: <b>{fmt_amount(u['balance'])}</b>\n"
         f"🔻 الحد الأدنى للشحن: <b>{fmt_amount(MIN_ICHANCY_DEPOSIT)}</b> من رصيد البوت = <b>{fmt_amount(MIN_ICHANCY_DEPOSIT * ICHANCY_UNITS_PER_BOT_UNIT)}</b> iChancy\n"
-        "🔁 كل 100 من رصيد البوت = 10,000 iChancy\n\n"
+        "🔁 تحويل iChancy يتم بنسبة 1:1 مع رصيد البوت\n\n"
         "أدخل المبلغ الذي ترغب بإضافته إلى حسابك."
     ), inline([nav_row("home", "🔙 إلغاء")]))
 
@@ -1578,8 +1579,8 @@ def show_ichancy_withdraw(chat_id):
     return set_panel(chat_id, (
         "↩️ <b>سحب من حساب iChancy</b>\n\n"
         f"🔻 الحد الأدنى للسحب: <b>{fmt_amount(MIN_ICHANCY_WITHDRAW)}</b> iChancy\n"
-        "🔁 التحويل: كل 10,000 iChancy = 100 من رصيد البوت\n\n"
-        "أدخل مبلغ iChancy المراد سحبه، ويجب أن يكون من مضاعفات 100."
+        "🔁 تحويل iChancy يتم بنسبة 1:1 مع رصيد البوت\n\n"
+        "أدخل مبلغ iChancy المراد سحبه."
     ), inline([nav_row("home", "🔙 إلغاء")]))
 
 
