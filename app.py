@@ -46,6 +46,7 @@ PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://asmar-robert-bot.onrender.com"
 ).rstrip("/")
 BRIDGE_SHARED_SECRET = os.environ.get("BRIDGE_SHARED_SECRET", "").strip()
+ADMIN_BRIDGE_SHARED_SECRET = os.environ.get("ADMIN_BRIDGE_SHARED_SECRET", "").strip()
 PLAYER_EMAIL_DOMAIN = os.environ.get("ICHANCY_PLAYER_EMAIL_DOMAIN", "asmarrobert.example").strip().lower()
 REGISTRATION_MODE = os.environ.get("ICHANCY_REGISTRATION_MODE", "auto").strip().lower()
 if REGISTRATION_MODE not in {"auto", "manual"}:
@@ -334,6 +335,10 @@ def ensure_db():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("ALTER TABLE bridge_jobs ADD COLUMN IF NOT EXISTS execution_attempt_id UUID")
+            cur.execute("ALTER TABLE bridge_jobs ADD COLUMN IF NOT EXISTS external_attempt_started_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE bridge_jobs ADD COLUMN IF NOT EXISTS external_attempt_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE bridge_jobs ADD COLUMN IF NOT EXISTS reconciliation_required BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS ichancy_registration_requests (
                     id BIGSERIAL PRIMARY KEY,
@@ -1309,7 +1314,8 @@ def show_ichancy_deposit(chat_id):
             "⚠️ <b>لا يوجد حساب iChancy مرتبط بحسابك.</b>\n\n"
             "أنشئ حساب iChancy أولًا للمتابعة."
         ), inline([[cb("🎮 إنشاء حساب iChancy", "ichancy_create")], nav_row("home")]))
-    flows[chat_id] = {"step": "ichancy_deposit_amount"}
+    flows[chat_id] = {"step": "ichancy_deposit_amount", "operation_ref": str(uuid.uuid4())}
+    save_persistent_flow(chat_id, flows[chat_id])
     return set_panel(chat_id, (
         "🎮 <b>شحن حساب iChancy</b>\n\n"
         f"💰 رصيدك المتاح: <b>{fmt_amount(u['balance'])}</b>\n"
@@ -1326,7 +1332,8 @@ def show_ichancy_withdraw(chat_id):
             "⚠️ <b>لا يوجد حساب iChancy مرتبط بحسابك.</b>\n\n"
             "أنشئ حساب iChancy أولًا للمتابعة."
         ), inline([[cb("🎮 إنشاء حساب iChancy", "ichancy_create")], nav_row("home")]))
-    flows[chat_id] = {"step": "ichancy_withdraw_amount"}
+    flows[chat_id] = {"step": "ichancy_withdraw_amount", "operation_ref": str(uuid.uuid4())}
+    save_persistent_flow(chat_id, flows[chat_id])
     return set_panel(chat_id, (
         "↩️ <b>سحب من حساب iChancy</b>\n\n"
         f"🔻 الحد الأدنى للسحب: <b>{fmt_amount(MIN_ICHANCY_WITHDRAW)}</b> iChancy\n"
@@ -1717,7 +1724,7 @@ def process_text_input(chat_id, text):
                 f"المبلغ المطلوب: <b>{fmt_amount(amount)}</b>"
             ), inline([nav_row("home")]))
             return True
-        result = enqueue_ichancy_deposit(chat_id, amount)
+        result = enqueue_ichancy_deposit(chat_id, amount, flow.get("operation_ref"))
         if not result.get("ok"):
             reason = result.get("reason")
             if reason == "player_not_mapped":
@@ -1745,7 +1752,7 @@ def process_text_input(chat_id, text):
         if ichancy_amount < MIN_ICHANCY_WITHDRAW:
             set_panel(chat_id, f"❌ <b>الحد الأدنى للسحب هو {fmt_amount(MIN_ICHANCY_WITHDRAW)} iChancy</b>", inline([nav_row("home", "🔙 إلغاء")]))
             return True
-        result = enqueue_ichancy_withdraw(chat_id, ichancy_amount)
+        result = enqueue_ichancy_withdraw(chat_id, ichancy_amount, flow.get("operation_ref"))
         flows.pop(chat_id, None)
         if not result.get("ok"):
             reason = result.get("reason")
@@ -1912,8 +1919,9 @@ def handle_callback(query):
 def bridge_authorized(req):
     supplied = req.headers.get("X-Bridge-Key", "")
     return bool(BRIDGE_SHARED_SECRET) and hmac.compare_digest(supplied, BRIDGE_SHARED_SECRET)
-
-
+def admin_bridge_authorized(req):
+    supplied = req.headers.get("X-Admin-Bridge-Key", "")
+    return bool(ADMIN_BRIDGE_SHARED_SECRET) and hmac.compare_digest(supplied, ADMIN_BRIDGE_SHARED_SECRET)
 def bridge_json_error(message, status=400):
     return jsonify({"ok": False, "error": message}), status
 
@@ -1937,6 +1945,18 @@ def enqueue_bridge_job(request_id, job_type, payload):
                 return dict(row)
             cur.execute("SELECT job_id, request_id, status FROM bridge_jobs WHERE request_id=%s", (request_id,))
             return dict(cur.fetchone())
+def enqueue_admin_players_read(operation_ref):
+    """Queue exactly one read-only get_players job for an authorized admin caller."""
+    operation_ref = str(operation_ref or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", operation_ref):
+        return {"ok": False, "reason": "invalid_operation_ref"}
+    if not db_enabled():
+        return {"ok": False, "reason": "postgres_required"}
+    job = enqueue_bridge_job(f"admin-get-players:{operation_ref}", "get_players", {
+        "source": "admin_readonly",
+        "operation_ref": operation_ref,
+    })
+    return {"ok": True, "job_id": str(job["job_id"]), "request_id": job["request_id"], "status": job["status"]}
 
 
 def generated_player_email(username, chat_id):
@@ -1994,7 +2014,7 @@ def enqueue_player_registration(chat_id, username, password):
     return {"ok": True, "job_id": str(job["job_id"])}
 
 
-def enqueue_ichancy_deposit(chat_id, amount):
+def enqueue_ichancy_deposit(chat_id, amount, operation_ref=None):
     """Queue an idempotent iChancy deposit for the authenticated phone Bridge."""
     if not db_enabled():
         return {"ok": False, "reason": "postgres_required"}
@@ -2007,7 +2027,10 @@ def enqueue_ichancy_deposit(chat_id, amount):
     if amount <= 0 or amount > int(user.get("balance") or 0):
         return {"ok": False, "reason": "insufficient_balance"}
     currency = str(user.get("ichancy_currency") or "USD").strip() or "USD"
-    request_id = f"ichancy-deposit:{chat_id}:{uuid.uuid4()}"
+    operation_ref = str(operation_ref or "").strip()
+    if not operation_ref:
+        operation_ref = str(uuid.uuid4())
+    request_id = f"ichancy-deposit:{chat_id}:{operation_ref}"
     ichancy_amount = amount * ICHANCY_UNITS_PER_BOT_UNIT
     payload = {
         "telegram_id": int(chat_id),
@@ -2019,6 +2042,15 @@ def enqueue_ichancy_deposit(chat_id, amount):
     }
     job = enqueue_bridge_job(request_id, "deposit", payload)
     with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM transactions
+                WHERE tx_type='ichancy_deposit' AND details->>'job_id'=%s
+                LIMIT 1
+            """, (str(job["job_id"]),))
+            if cur.fetchone():
+                return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id,
+                        "bot_amount": amount, "ichancy_amount": ichancy_amount}
         add_transaction(
             chat_id, "ichancy_deposit", amount, "pending", "bridge",
             {"request_id": request_id, "job_id": str(job["job_id"]), "player_id": player_id,
@@ -2047,7 +2079,7 @@ def enqueue_ichancy_balance(chat_id):
     return {"ok": True, "job_id": str(job["job_id"])}
 
 
-def enqueue_ichancy_withdraw(chat_id, ichancy_amount):
+def enqueue_ichancy_withdraw(chat_id, ichancy_amount, operation_ref=None):
     """Queue an iChancy withdrawal; credit the bot only after bridge confirmation."""
     if not db_enabled():
         return {"ok": False, "reason": "postgres_required"}
@@ -2061,7 +2093,10 @@ def enqueue_ichancy_withdraw(chat_id, ichancy_amount):
         return {"ok": False, "reason": "invalid_conversion"}
     bot_amount = ichancy_amount // ICHANCY_UNITS_PER_BOT_UNIT
     currency = str(user.get("ichancy_currency") or "USD").strip() or "USD"
-    request_id = f"ichancy-withdraw:{chat_id}:{uuid.uuid4()}"
+    operation_ref = str(operation_ref or "").strip()
+    if not operation_ref:
+        operation_ref = str(uuid.uuid4())
+    request_id = f"ichancy-withdraw:{chat_id}:{operation_ref}"
     payload = {
         "telegram_id": int(chat_id), "player_id": player_id,
         "amount": ichancy_amount, "bot_amount": bot_amount,
@@ -2069,6 +2104,15 @@ def enqueue_ichancy_withdraw(chat_id, ichancy_amount):
     }
     job = enqueue_bridge_job(request_id, "withdraw", payload)
     with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM transactions
+                WHERE tx_type='ichancy_withdraw' AND details->>'job_id'=%s
+                LIMIT 1
+            """, (str(job["job_id"]),))
+            if cur.fetchone():
+                return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id,
+                        "bot_amount": bot_amount, "ichancy_amount": ichancy_amount}
         add_transaction(
             chat_id, "ichancy_withdraw", bot_amount, "pending", "bridge",
             {"request_id": request_id, "job_id": str(job["job_id"]),
@@ -2115,6 +2159,21 @@ def bridge_heartbeat():
     return jsonify({"ok": True, "device_id": device_id, "status": "online", "server_time": datetime.now(timezone.utc).isoformat()})
 
 
+@app.route("/admin/v1/bridge/players", methods=["POST"])
+def admin_bridge_players():
+    """Create an admin-only, read-only get_players job; no financial types accepted."""
+    if not admin_bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    if set(body) - {"operation_ref"}:
+        return bridge_json_error("only operation_ref is allowed")
+    result = enqueue_admin_players_read(body.get("operation_ref"))
+    if not result.get("ok"):
+        status = 503 if result.get("reason") == "postgres_required" else 400
+        return bridge_json_error(result["reason"], status)
+    return jsonify(result), 202
+
+
 @app.route("/bridge/v1/jobs/next", methods=["POST"])
 def bridge_next_job():
     if not bridge_authorized(request):
@@ -2136,10 +2195,36 @@ def bridge_next_job():
             """, (device_id,))
             if not cur.fetchone():
                 return bridge_json_error("device_not_registered_or_stale", 409)
-            # Requeue work abandoned by a disconnected bridge after 2 minutes.
+            # Never requeue an abandoned financial request: its external outcome
+            # is unknown and automatic replay could duplicate the operation.
+            cur.execute("""
+                UPDATE bridge_jobs
+                SET status='unknown_external_result', reconciliation_required=TRUE,
+                    result=COALESCE(result, '{}'::jsonb) || jsonb_build_object(
+                        'external_result_state', 'unknown',
+                        'stage', 'bridge_disconnected_before_completion',
+                        'retry_blocked', TRUE
+                    ), updated_at=NOW()
+                WHERE status='running'
+                  AND job_type IN ('deposit','withdraw')
+                  AND updated_at < NOW() - INTERVAL '2 minutes'
+            """)
+            cur.execute("""
+                UPDATE transactions t
+                SET status='unknown_external_result',
+                    details=details || jsonb_build_object('reconciliation_required', TRUE)
+                WHERE t.status='pending'
+                  AND t.details->>'job_id' IN (
+                      SELECT job_id::text FROM bridge_jobs
+                      WHERE status='unknown_external_result'
+                        AND job_type IN ('deposit','withdraw')
+                        AND reconciliation_required=TRUE
+                  )
+            """)
             cur.execute("""
                 UPDATE bridge_jobs SET status='pending', claimed_by=NULL, updated_at=NOW()
-                WHERE status='running' AND updated_at < NOW() - INTERVAL '2 minutes'
+                WHERE status='running' AND job_type NOT IN ('deposit','withdraw')
+                  AND updated_at < NOW() - INTERVAL '2 minutes'
             """)
             cur.execute("""
                 UPDATE ichancy_registration_requests r
@@ -2173,7 +2258,8 @@ def bridge_next_job():
             """)
             if requested_types:
                 cur.execute("""
-                    SELECT job_id::text AS job_id, request_id, job_type, payload, attempts
+                    SELECT job_id::text AS job_id, request_id, job_type, payload, attempts,
+                           execution_attempt_id::text AS execution_attempt_id
                     FROM bridge_jobs
                     WHERE status='pending' AND job_type = ANY(%s)
                     ORDER BY created_at
@@ -2182,7 +2268,8 @@ def bridge_next_job():
                 """, (requested_types,))
             else:
                 cur.execute("""
-                    SELECT job_id::text AS job_id, request_id, job_type, payload, attempts
+                    SELECT job_id::text AS job_id, request_id, job_type, payload, attempts,
+                           execution_attempt_id::text AS execution_attempt_id
                     FROM bridge_jobs
                     WHERE status='pending'
                     ORDER BY created_at
@@ -2192,12 +2279,30 @@ def bridge_next_job():
             row = cur.fetchone()
             if not row:
                 return jsonify({"ok": True, "job": None})
-            cur.execute("""
-                UPDATE bridge_jobs
-                SET status='running', attempts=attempts+1, claimed_by=%s,
-                    started_at=COALESCE(started_at,NOW()), updated_at=NOW()
-                WHERE job_id=%s
-            """, (device_id, row["job_id"]))
+            if row["job_type"] in {"deposit", "withdraw"}:
+                attempt_id = str(uuid.uuid4())
+                cur.execute("""
+                    UPDATE bridge_jobs
+                    SET status='running', attempts=attempts+1, claimed_by=%s,
+                        execution_attempt_id=%s,
+                        external_attempt_started_at=NOW(),
+                        external_attempt_count=external_attempt_count+1,
+                        reconciliation_required=FALSE,
+                        started_at=COALESCE(started_at,NOW()), updated_at=NOW()
+                    WHERE job_id=%s AND status='pending'
+                    RETURNING execution_attempt_id::text AS execution_attempt_id
+                """, (device_id, attempt_id, row["job_id"]))
+                claimed = cur.fetchone()
+                if not claimed:
+                    return jsonify({"ok": True, "job": None})
+                row["execution_attempt_id"] = claimed["execution_attempt_id"]
+            else:
+                cur.execute("""
+                    UPDATE bridge_jobs
+                    SET status='running', attempts=attempts+1, claimed_by=%s,
+                        started_at=COALESCE(started_at,NOW()), updated_at=NOW()
+                    WHERE job_id=%s AND status='pending'
+                """, (device_id, row["job_id"]))
             if row["job_type"] == "register_player":
                 payload = row.get("payload") or {}
                 cur.execute("""
@@ -2219,8 +2324,9 @@ def bridge_complete_job(job_id):
     body = request.get_json(silent=True) or {}
     device_id = str(body.get("device_id", "")).strip()
     status = body.get("status")
-    if status not in {"succeeded", "failed"}:
-        return bridge_json_error("status must be succeeded or failed")
+    if status not in {"succeeded", "failed", "unknown_external_result"}:
+        return bridge_json_error("status must be succeeded, failed, or unknown_external_result")
+    execution_attempt_id = str(body.get("execution_attempt_id") or "").strip()
     if not db_enabled():
         return bridge_json_error("postgres_required", 503)
     ensure_db()
@@ -2228,12 +2334,31 @@ def bridge_complete_job(job_id):
     accepted_completion = False
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE bridge_jobs
-                SET status=%s, result=%s, error=%s, finished_at=NOW(), updated_at=NOW()
-                WHERE job_id=%s AND status='running' AND claimed_by=%s
-                RETURNING job_id::text AS job_id, request_id, status
-            """, (status, Json(body.get("result") or {}), str(body.get("error", ""))[:500] or None, job_id, device_id))
+            if execution_attempt_id:
+                completion_sql = """
+                    UPDATE bridge_jobs
+                    SET status=%s, result=%s, error=%s,
+                        reconciliation_required=(%s='unknown_external_result'),
+                        finished_at=NOW(), updated_at=NOW()
+                    WHERE job_id=%s
+                      AND job_type IN ('deposit','withdraw')
+                      AND status IN ('running','unknown_external_result')
+                      AND claimed_by=%s
+                      AND execution_attempt_id=%s
+                    RETURNING job_id::text AS job_id, request_id, status
+                """
+                completion_params = (status, Json(body.get("result") or {}), str(body.get("error", ""))[:500] or None,
+                                     status, job_id, device_id, execution_attempt_id)
+            else:
+                completion_sql = """
+                    UPDATE bridge_jobs
+                    SET status=%s, result=%s, error=%s, finished_at=NOW(), updated_at=NOW()
+                    WHERE job_id=%s AND status='running' AND claimed_by=%s
+                      AND execution_attempt_id IS NULL
+                    RETURNING job_id::text AS job_id, request_id, status
+                """
+                completion_params = (status, Json(body.get("result") or {}), str(body.get("error", ""))[:500] or None, job_id, device_id)
+            cur.execute(completion_sql, completion_params)
             row = cur.fetchone()
             accepted_completion = bool(row)
             if not row:
@@ -2279,57 +2404,74 @@ def bridge_complete_job(job_id):
             if accepted_completion and completed_job and completed_job.get("job_type") == "get_balance":
                 # Read-only result: never mutate the bot balance or financial ledger.
                 pass
-            if accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
+            if accepted_completion and completed_job and completed_job.get("job_type") in {"deposit", "withdraw"}:
                 payload = completed_job.get("payload") or {}
                 telegram_id = payload.get("telegram_id")
+                kind = completed_job.get("job_type")
+                tx_type = "ichancy_deposit" if kind == "deposit" else "ichancy_withdraw"
                 amount = int(payload.get("bot_amount") or 0)
-                if telegram_id and status == "succeeded" and amount > 0:
-                    cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (int(telegram_id),))
-                    user = cur.fetchone()
-                    if not user or int(user.get("balance") or 0) < amount:
-                        status = "failed"
-                        cur.execute("UPDATE bridge_jobs SET status='failed', error=%s WHERE job_id=%s", ("insufficient_balance_after_confirmation", job_id))
-                        cur.execute("""
-                            UPDATE transactions SET status='failed'
-                            WHERE telegram_id=%s AND tx_type='ichancy_deposit'
-                              AND details->>'job_id'=%s AND status='pending'
-                        """, (int(telegram_id), str(job_id)))
-                    else:
-                        before = int(user["balance"] or 0)
-                        after = before - amount
-                        cur.execute("UPDATE users SET balance=%s,updated_at=NOW() WHERE telegram_id=%s", (after, int(telegram_id)))
-                        cur.execute("""
-                            UPDATE transactions SET status='completed', balance_before=%s, balance_after=%s
-                            WHERE telegram_id=%s AND tx_type='ichancy_deposit'
-                              AND details->>'job_id'=%s AND status='pending'
-                        """, (before, after, int(telegram_id), str(job_id)))
-                elif telegram_id:
-                    cur.execute("""
-                        UPDATE transactions SET status='failed'
-                        WHERE telegram_id=%s AND tx_type='ichancy_deposit'
-                          AND details->>'job_id'=%s AND status='pending'
-                        """, (int(telegram_id), str(job_id)))
-            if accepted_completion and completed_job and completed_job.get("job_type") == "withdraw":
-                payload = completed_job.get("payload") or {}
-                telegram_id = payload.get("telegram_id")
-                amount = int(payload.get("bot_amount") or 0)
-                if telegram_id and status == "succeeded" and amount > 0:
-                    cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (int(telegram_id),))
-                    user = cur.fetchone()
-                    before = int(user["balance"] or 0) if user else 0
-                    after = before + amount
-                    cur.execute("UPDATE users SET balance=%s,updated_at=NOW() WHERE telegram_id=%s", (after, int(telegram_id)))
-                    cur.execute("""
-                        UPDATE transactions SET status='completed', balance_before=%s, balance_after=%s
-                        WHERE telegram_id=%s AND tx_type='ichancy_withdraw'
-                          AND details->>'job_id'=%s AND status='pending'
-                    """, (before, after, int(telegram_id), str(job_id)))
-                elif telegram_id:
-                    cur.execute("""
-                        UPDATE transactions SET status='failed'
-                        WHERE telegram_id=%s AND tx_type='ichancy_withdraw'
-                          AND details->>'job_id'=%s AND status='pending'
-                    """, (int(telegram_id), str(job_id)))
+                if telegram_id:
+                    cur.execute("SAVEPOINT financial_settlement")
+                    try:
+                        if status == "unknown_external_result":
+                            cur.execute("""
+                                UPDATE transactions SET status='unknown_external_result',
+                                    details=details || jsonb_build_object('reconciliation_required', TRUE)
+                                WHERE telegram_id=%s AND tx_type=%s
+                                  AND details->>'job_id'=%s
+                                  AND status IN ('pending','unknown_external_result')
+                            """, (int(telegram_id), tx_type, str(job_id)))
+                            if cur.rowcount != 1:
+                                raise RuntimeError(f"{kind}_unknown_transaction_rowcount")
+                        elif status == "succeeded" and amount > 0:
+                            cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (int(telegram_id),))
+                            user = cur.fetchone()
+                            if not user:
+                                raise RuntimeError(f"{kind}_user_missing")
+                            before = int(user["balance"] or 0)
+                            if kind == "deposit" and before < amount:
+                                raise RuntimeError("deposit_local_balance_insufficient")
+                            after = before - amount if kind == "deposit" else before + amount
+                            cur.execute("UPDATE users SET balance=%s,updated_at=NOW() WHERE telegram_id=%s", (after, int(telegram_id)))
+                            if cur.rowcount != 1:
+                                raise RuntimeError(f"{kind}_balance_rowcount")
+                            cur.execute("""
+                                UPDATE transactions SET status='completed', balance_before=%s, balance_after=%s
+                                WHERE telegram_id=%s AND tx_type=%s
+                                  AND details->>'job_id'=%s AND status IN ('pending','unknown_external_result')
+                            """, (before, after, int(telegram_id), tx_type, str(job_id)))
+                            if cur.rowcount != 1:
+                                raise RuntimeError(f"{kind}_completed_transaction_rowcount")
+                        else:
+                            cur.execute("""
+                                UPDATE transactions SET status='failed'
+                                WHERE telegram_id=%s AND tx_type=%s
+                                  AND details->>'job_id'=%s AND status IN ('pending','unknown_external_result')
+                            """, (int(telegram_id), tx_type, str(job_id)))
+                            if cur.rowcount != 1:
+                                raise RuntimeError(f"{kind}_rejected_transaction_rowcount")
+                        cur.execute("RELEASE SAVEPOINT financial_settlement")
+                    except Exception as settlement_error:
+                        cur.execute("ROLLBACK TO SAVEPOINT financial_settlement")
+                        if status == "succeeded":
+                            reconciliation_error = f"external_succeeded_local_settlement_failed:{settlement_error}"[:500]
+                            cur.execute("""
+                                UPDATE bridge_jobs
+                                SET status='external_succeeded_reconciliation_required',
+                                    reconciliation_required=TRUE, error=%s, updated_at=NOW()
+                                WHERE job_id=%s AND status='succeeded'
+                            """, (reconciliation_error, job_id))
+                            cur.execute("""
+                                UPDATE transactions SET status='external_succeeded_reconciliation_required',
+                                    details=details || jsonb_build_object('reconciliation_required', TRUE, 'external_status', 'succeeded')
+                                WHERE telegram_id=%s AND tx_type=%s
+                                  AND details->>'job_id'=%s
+                                  AND status IN ('pending','unknown_external_result')
+                            """, (int(telegram_id), tx_type, str(job_id)))
+                            if cur.rowcount != 1:
+                                raise RuntimeError(f"{kind}_reconciliation_transaction_rowcount") from settlement_error
+                        else:
+                            raise
     if accepted_completion and completed_job and completed_job.get("job_type") == "register_player":
         payload = completed_job.get("payload") or {}
         chat_id = payload.get("telegram_id")
