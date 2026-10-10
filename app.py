@@ -6,7 +6,6 @@ import base64
 import hashlib
 import hmac
 import secrets
-import traceback
 import time
 import threading
 import uuid
@@ -28,6 +27,30 @@ from requests.adapters import HTTPAdapter
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, request, jsonify
 from ichancy_provider import IchancyAgentClient
+from payment_schema import install_payment_schema
+from payment_storage import (
+    MAX_ASSET_BYTES,
+    mark_asset_deleted,
+    retire_asset,
+    storage_from_environment,
+    upload_payment_asset,
+    validate_image,
+)
+from payment_calculations import calculate_deposit_quote, calculate_withdraw_quote, validate_dynamic_fields, ichancy_deposit_units, ichancy_withdraw_bot_units, normalize_operation_reference
+from payment_schema import (
+    install_payment_schema,
+    create_method_snapshot,
+    reserve_withdrawal,
+    approve_withdrawal,
+    start_withdrawal_payout,
+    record_external_outcome,
+    settle_withdrawal,
+    release_withdrawal,
+    mark_withdrawal_unknown,
+    record_financial_audit,
+    record_external_verification,
+    settle_topup_after_verification,
+)
 
 app = Flask(__name__)
 
@@ -47,6 +70,7 @@ PUBLIC_BASE_URL = os.environ.get(
 ).rstrip("/")
 BRIDGE_SHARED_SECRET = os.environ.get("BRIDGE_SHARED_SECRET", "").strip()
 ADMIN_BRIDGE_SHARED_SECRET = os.environ.get("ADMIN_BRIDGE_SHARED_SECRET", "").strip()
+FINANCIAL_ADMIN_SERVICE_ID = os.environ.get("FINANCIAL_ADMIN_SERVICE_ID", "admin_service").strip() or "admin_service"
 PLAYER_EMAIL_DOMAIN = os.environ.get("ICHANCY_PLAYER_EMAIL_DOMAIN", "asmarrobert.example").strip().lower()
 REGISTRATION_MODE = os.environ.get("ICHANCY_REGISTRATION_MODE", "auto").strip().lower()
 if REGISTRATION_MODE not in {"auto", "manual"}:
@@ -65,6 +89,7 @@ _DB_INITIALIZED = False
 _BONUS_CACHE = {"expires": 0.0, "value": {}}
 _SUPPORT_CACHE = {"expires": 0.0, "value": []}
 _ICHANCY_CLIENT = None
+_PAYMENT_STORAGE = None
 
 flows = {}
 panel_message_ids = {}
@@ -99,6 +124,41 @@ SHAM_SYP_ACCOUNT_ID = "52b1612cc4685d57d0adb96d4d1be37a"
 SHAM_SYP_ACCOUNT_NAME = "هشام محمد فتوح"
 ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
 SHAM_SYP_QR_PATH = os.path.join(ASSET_DIR, "sham_cash_syp.jpg")
+
+
+class ShamCashVerificationProvider:
+    """Provider contract; no real Sham Cash integration exists locally."""
+
+    name = "unconfigured"
+
+    def verify(self, *_args, **_kwargs):
+        raise RuntimeError("sham_cash_provider_not_configured")
+
+
+class LocalTestShamCashVerificationProvider(ShamCashVerificationProvider):
+    """Test-only adapter; it cannot be enabled by production configuration."""
+
+    name = "local_test_mock"
+
+    def verify(self, external_reference, amount_original, currency, beneficiary):
+        if os.environ.get("LOCAL_TEST_MODE") != "1":
+            raise RuntimeError("test_mock_disabled")
+        return {
+            "provider_name": self.name,
+            "verification_status": "verified",
+            "external_reference": str(external_reference),
+            "amount_original": str(amount_original),
+            "currency": str(currency),
+            "beneficiary": str(beneficiary),
+            "provider_trace_id": "local-test-only",
+        }
+
+
+def sham_cash_verification_provider():
+    """Return only the local mock under an explicit local-test flag."""
+    if os.environ.get("LOCAL_TEST_MODE") == "1":
+        return LocalTestShamCashVerificationProvider()
+    return ShamCashVerificationProvider()
 
 
 # -----------------------------------------------------------------------------
@@ -293,12 +353,6 @@ def ensure_db():
                 CREATE INDEX IF NOT EXISTS idx_cash_requests_type_status
                 ON cash_requests(request_type,status,created_at DESC)
             """)
-            # The same transfer reference cannot be submitted twice for the same method.
-            cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_requests_topup_method_ref
-                ON cash_requests(method, (details->>'operation_ref'))
-                WHERE request_type='topup' AND details ? 'operation_ref'
-            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS conversation_flows (
                     telegram_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -412,6 +466,9 @@ def ensure_db():
                     "INSERT INTO bonuses(method, percent) VALUES(%s, %s) ON CONFLICT(method) DO NOTHING",
                     (method, percent),
                 )
+            # Additive payment configuration and reservation schema. Existing
+            # iChancy/Bridge tables and financial paths remain unchanged.
+            install_payment_schema(cur)
     _DB_INITIALIZED = True
 
 
@@ -880,7 +937,7 @@ def create_sham_syp_topup_request(chat_id, cash_amount, operation_ref):
         return {"ok": False, "reason": "storage_unavailable"}
 
     ensure_db()
-    operation_ref = operation_ref.strip()
+    operation_ref = normalize_operation_reference(operation_ref)
     bonus_percent = int(get_bonuses().get("sham", 0))
     base_bot = int(cash_amount) * SYP_TO_BOT_MULTIPLIER
     bonus_amount = (base_bot * bonus_percent) // 100
@@ -906,6 +963,7 @@ def create_sham_syp_topup_request(chat_id, cash_amount, operation_ref):
                         amount_cash, method, destination, status, details
                     )
                     VALUES(%s,%s,'topup',%s,%s,%s,%s,'pending',%s)
+                    RETURNING id
                 """, (
                     request_code,
                     chat_id,
@@ -915,6 +973,7 @@ def create_sham_syp_topup_request(chat_id, cash_amount, operation_ref):
                     SHAM_SYP_ACCOUNT_ID,
                     Json(details),
                 ))
+                cash_request_id = int(cur.fetchone()["id"])
 
             tx_code = add_transaction(
                 chat_id,
@@ -922,11 +981,14 @@ def create_sham_syp_topup_request(chat_id, cash_amount, operation_ref):
                 total_bot,
                 "pending",
                 method,
-                {**details, "request_code": request_code, "cash_amount": int(cash_amount)},
+                {**details, "request_code": request_code, "cash_amount": int(cash_amount),
+                 "cash_request_id": cash_request_id},
                 None,
                 None,
                 conn=conn,
             )
+            with conn.cursor() as link_cur:
+                link_cur.execute("UPDATE transactions SET cash_request_id=%s WHERE tx_code=%s", (cash_request_id, tx_code))
     except psycopg2.errors.UniqueViolation:
         return {"ok": False, "reason": "duplicate_ref"}
 
@@ -943,9 +1005,95 @@ def create_sham_syp_topup_request(chat_id, cash_amount, operation_ref):
     }
 
 
+def verify_and_settle_sham_syp_for_local_test(cash_request_id, external_reference,
+                                              amount_original, currency,
+                                              beneficiary, actor_id="local-test"):
+    """Test-only provider path; production stays disabled without a real provider."""
+    provider = sham_cash_verification_provider()
+    evidence = provider.verify(external_reference, amount_original, currency, beneficiary)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM cash_requests WHERE id=%s FOR UPDATE", (int(cash_request_id),))
+            request_row = cur.fetchone()
+            if not request_row:
+                raise ValueError("topup_request_not_found")
+            if request_row["status"] not in {"pending", "approved", "externally_verified"}:
+                raise ValueError("topup_not_verifiable")
+            record_external_verification(
+                cur, int(cash_request_id), evidence["provider_name"],
+                evidence["verification_status"], evidence["external_reference"],
+                evidence["amount_original"], evidence["currency"],
+                evidence["beneficiary"], evidence["provider_trace_id"],
+                {"test_only": True},
+            )
+            cur.execute(
+                """UPDATE cash_requests
+                   SET status='externally_verified',external_outcome='external_confirmed_success',updated_at=NOW()
+                 WHERE id=%s AND status IN ('pending','approved','externally_verified')""",
+                (int(cash_request_id),),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("topup_verification_transition_failed")
+            record_financial_audit(
+                cur, actor_id, "test_provider", "external_verification",
+                int(cash_request_id), "topup", request_row["status"],
+                "externally_verified", "verified", "local_test_provider_only",
+                None, evidence["external_reference"], {"test_only": True},
+            )
+            settled = settle_topup_after_verification(
+                cur, int(cash_request_id), evidence["provider_name"],
+                evidence["external_reference"], evidence["amount_original"],
+                evidence["currency"], evidence["beneficiary"], actor_id,
+                "test_provider",
+            )
+            return {"verified": True, "settled": bool(settled), "test_only": True}
+
+
 # -----------------------------------------------------------------------------
 # Telegram helpers
 # -----------------------------------------------------------------------------
+def _telegram_safe_error(method, status_code=None, payload=None):
+    """Log only bounded, non-sensitive Telegram error metadata."""
+    payload = payload if isinstance(payload, dict) else {}
+    code = payload.get("error_code") or payload.get("code") or "telegram_error"
+    code = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(code))[:80]
+    trace_id = payload.get("trace_id") or payload.get("request_id") or payload.get("error_id")
+    trace_id = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(trace_id))[:80] if trace_id else "-"
+    http = str(status_code) if status_code is not None else "-"
+    print(f"telegram_error method={method} http={http} code={code} trace={trace_id}", flush=True)
+
+
+def _safe_exception_metadata(operation, exc):
+    """Emit only non-sensitive exception metadata and return a trace id."""
+    trace_id = uuid.uuid4().hex[:12]
+    exception_type = re.sub(r"[^A-Za-z0-9_.:-]", "_", type(exc).__name__)[:80]
+    print(f"exception operation={operation} type={exception_type} trace={trace_id}", flush=True)
+    return trace_id
+
+
+def _safe_public_error(exc, fallback):
+    """Keep only predefined-looking error codes, never arbitrary exception text."""
+    value = exc.args[0] if getattr(exc, "args", None) else None
+    if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_.:-]{0,79}", value):
+        return value
+    return fallback
+
+
+def _customer_job_outcome_message(job_type, status):
+    """Return customer-safe status text; never expose Bridge/provider error text."""
+    if job_type == "deposit":
+        if status == "unknown_external_result":
+            return "⚠️ <b>نتيجة شحن حساب iChancy غير محسومة حاليًا</b>\n\nتم إيقاف إعادة التنفيذ تلقائيًا، ولم يُخصم المبلغ حتى تُحسم النتيجة بالمصالحة."
+        return "⚠️ <b>لم يكتمل شحن حساب iChancy</b>\n\nلم يتم خصم المبلغ من رصيدك. يمكنك المحاولة لاحقًا بعد التأكد من جاهزية الجسر."
+    if job_type == "withdraw":
+        if status == "unknown_external_result":
+            return "⚠️ <b>نتيجة سحب iChancy غير محسومة حاليًا</b>\n\nتم تعليق العملية وإحالتها إلى المصالحة، ولم تتم إضافة أي رصيد إلى البوت أو إعادة تنفيذ السحب تلقائيًا."
+        return "⚠️ <b>لم يكتمل سحب iChancy</b>\n\nلم تتم إضافة أي رصيد إلى البوت. يمكنك المحاولة لاحقًا بعد التأكد من جاهزية الجسر."
+    if job_type == "get_balance":
+        return "⚠️ <b>تعذر تحديث الرصيد من iChancy</b>\n\nحاول مرة أخرى لاحقًا."
+    return "⚠️ <b>لم تكتمل العملية</b>\n\nحاول مرة أخرى لاحقًا."
+
+
 def tg(method, payload=None, timeout=4):
     if not BOT_TOKEN:
         return {"ok": False, "description": "BOT_TOKEN missing"}
@@ -960,11 +1108,23 @@ def tg(method, payload=None, timeout=4):
         except Exception:
             data = {"ok": False, "description": f"Telegram HTTP {r.status_code}"}
         if not data.get("ok"):
-            print(f"Telegram API error in {method}: {data}", flush=True)
+            _telegram_safe_error(method, r.status_code, data)
         return data
     except Exception as exc:
-        print(f"Telegram API exception in {method}: {exc}", flush=True)
-        return {"ok": False, "description": str(exc)}
+        trace_id = _safe_exception_metadata(f"telegram.{method}", exc)
+        return {"ok": False, "description": "telegram_request_failed", "trace_id": trace_id}
+
+
+def download_telegram_photo(photo_sizes):
+    if not photo_sizes:
+        raise ValueError("proof_image_required")
+    file_info = tg("getFile", {"file_id": photo_sizes[-1].get("file_id")}, timeout=10)
+    path = ((file_info.get("result") or {}).get("file_path")) if file_info.get("ok") else None
+    if not path:
+        raise ValueError("proof_image_unavailable")
+    response = TG_SESSION.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", timeout=(3.0, 20.0))
+    response.raise_for_status()
+    return response.content
 
 
 def ensure_native_menu():
@@ -1032,11 +1192,11 @@ def send_photo_file(chat_id, path, caption, reply_markup=None):
             )
         result = r.json()
         if not result.get("ok"):
-            print(f"Telegram API error in sendPhoto: {result}", flush=True)
+            _telegram_safe_error("sendPhoto", r.status_code, result)
         return result
     except Exception as exc:
-        print(f"Telegram API exception in sendPhoto: {exc}", flush=True)
-        return {"ok": False, "description": str(exc)}
+        trace_id = _safe_exception_metadata("telegram.sendPhoto", exc)
+        return {"ok": False, "description": "telegram_request_failed", "trace_id": trace_id}
 
 
 def inline(rows):
@@ -1178,6 +1338,11 @@ def show_account(chat_id, created=False):
 
 
 def show_topup(chat_id):
+    methods = dynamic_payment_methods("deposit")
+    if methods:
+        rows = [[cb(f"💳 {method['display_name']}", f"dyn_dep:{method['method_id']}")] for method in methods]
+        rows.append(nav_row("home"))
+        return set_panel(chat_id, "💳 <b>اختر طريقة الإيداع</b>\n\nتظهر هنا الطرق المفعلة فقط.", inline(rows))
     u = get_user(chat_id)
     b = get_bonuses()
     text = (
@@ -1284,6 +1449,11 @@ def show_topup_ready(chat_id, method_name, currency, amount):
 
 
 def show_withdraw_bot(chat_id):
+    methods = dynamic_payment_methods("withdraw")
+    if methods:
+        rows = [[cb(f"💸 {method['display_name']}", f"dyn_wd:{method['method_id']}")] for method in methods]
+        rows.append(nav_row("home"))
+        return set_panel(chat_id, "💸 <b>اختر طريقة السحب</b>\n\nتظهر هنا الطرق المفعلة للسحب فقط.", inline(rows))
     u = get_user(chat_id)
     return set_panel(chat_id, (
         "💸 <b>سحب رصيد البوت</b>\n\n"
@@ -1305,6 +1475,77 @@ def show_withdraw_method(chat_id, method_name):
         f"🔻 الحد الأدنى للسحب: <b>{fmt_amount(MIN_BOT_WITHDRAW)}</b>\n\n"
         "أدخل المبلغ المطلوب سحبه من رصيد البوت."
     ), inline([nav_row("withdraw_bot", "🔙 إلغاء")]))
+
+
+def _dynamic_method(method_id, direction):
+    return next((m for m in dynamic_payment_methods(direction) if int(m["method_id"]) == int(method_id)), None)
+
+
+def _dynamic_prompt_next(chat_id):
+    flow = flows.get(chat_id) or {}
+    remaining = flow.get("remaining_fields") or []
+    if not remaining:
+        try:
+            result = create_dynamic_cash_request(chat_id, flow["method"], flow["direction"], flow["values"], flow.get("attachment_content"))
+            flows.pop(chat_id, None)
+            quote = result["quote"]
+            amount = quote.get("bot_amount", quote.get("payout_amount"))
+            label = "سيضاف إلى رصيدك" if flow["direction"] == "deposit" else "المبلغ المتوقع استلامه"
+            return set_panel(chat_id, f"✅ <b>تم استلام طلبك</b>\n\nرقم الطلب: <code>{result['request_code']}</code>\n{label}: <b>{fmt_amount(amount)}</b>\n\nسيتم التحقق من الطلب قبل أي تسوية مالية.", inline([nav_row("home")]))
+        except ValueError as exc:
+            flows.pop(chat_id, None)
+            error_code = _safe_public_error(exc, "invalid_request")
+            if error_code in {"amount_below_minimum", "amount_above_maximum"}:
+                message = "المبلغ خارج الحدود المسموحة."
+            elif error_code.startswith("operation_reference_"):
+                message = "رقم العملية غير صالح أو مفقود."
+            else:
+                message = "البيانات المطلوبة غير مكتملة."
+            return set_panel(chat_id, f"⚠️ {message}", inline([nav_row("home")]))
+        except psycopg2.errors.UniqueViolation:
+            flows.pop(chat_id, None)
+            return set_panel(chat_id, "❌ رقم العملية مكرر أو مستخدم مسبقًا. يرجى التأكد من الرقم وإرسال رقم عملية لم يُستخدم من قبل.", inline([nav_row("home")]))
+        except Exception:
+            flows.pop(chat_id, None)
+            return set_panel(chat_id, "⚠️ تعذر حفظ الطلب حاليًا. لم يتم إنشاء طلب ناقص.", inline([nav_row("home")]))
+    key = remaining.pop(0)
+    flow["current_field"] = key
+    if key == "proof_image":
+        prompt = "🧾 أرسل صورة إثبات التحويل."
+    else:
+        prompt = {"operation_reference": "🧾 اكتب رقم العملية.", "note": "📝 اكتب ملاحظة اختيارية.", "recipient_account": "🏦 اكتب حساب الاستلام.", "recipient_name": "👤 اكتب اسم المستلم.", "network": "🌐 اكتب الشبكة."}.get(key, "✏️ أرسل البيانات المطلوبة.")
+    mode = (flow.get("fields") or {}).get(key)
+    suffix = "\nيمكنك التخطي." if mode == "optional" else ""
+    buttons = [[cb("⏭ تخطي", f"dyn_skip:{chat_id}")]] if mode == "optional" else []
+    buttons.append(nav_row("home"))
+    return set_panel(chat_id, prompt + suffix, inline(buttons))
+
+
+def _start_dynamic_payment(chat_id, method_id, direction):
+    method = _dynamic_method(method_id, direction)
+    if not method:
+        return set_panel(chat_id, "⚠️ طريقة الدفع غير متاحة حاليًا.", inline([nav_row("home")]))
+    fields = method.get("fields") or {}
+    ordered = [key for key in ("operation_reference", "proof_image", "note", "recipient_account", "recipient_name", "network") if fields.get(key) != "disabled"]
+    flows[chat_id] = {"step": "dynamic_amount", "direction": direction, "method": method, "fields": fields, "remaining_fields": ordered, "values": {}}
+    minimum = method.get("minimum_amount") or (20000 if direction == "withdraw" else 0)
+    label = "رصيد البوت" if direction == "withdraw" else method.get("payment_currency", "المبلغ")
+    details = [f"💳 <b>{html.escape(str(method['display_name']))}</b>"]
+    if method.get("account_name"):
+        details.append(f"الاسم: <b>{html.escape(str(method['account_name']))}</b>")
+    if method.get("account_identifier"):
+        details.append(f"الحساب: <code>{html.escape(str(method['account_identifier']))}</code>")
+    if method.get("network"):
+        details.append(f"الشبكة: <b>{html.escape(str(method['network']))}</b>")
+    if method.get("instructions"):
+        details.append(html.escape(str(method["instructions"])))
+    if method.get("asset_storage_key"):
+        try:
+            details.append(f'<a href="{html.escape(payment_storage().presign(method["asset_storage_key"], 300))}">عرض صورة الطريقة</a>')
+        except Exception:
+            pass
+    details.append(f"\n💰 أدخل المبلغ ({label}).\n🔻 الحد الأدنى: <b>{minimum}</b>")
+    return set_panel(chat_id, "\n".join(details), inline([nav_row("home", "🔙 إلغاء")]))
 
 
 def show_ichancy_deposit(chat_id):
@@ -1556,6 +1797,32 @@ def process_text_input(chat_id, text):
 
     step = flow.get("step")
     u = get_user(chat_id)
+
+    if step == "dynamic_amount":
+        try:
+            amount = parse_decimal_amount(text)
+            if amount is None:
+                raise ValueError("invalid_amount")
+            flow["values"]["amount"] = str(amount)
+            flow["step"] = "dynamic_field"
+            return bool(_dynamic_prompt_next(chat_id))
+        except ValueError:
+            set_panel(chat_id, "⚠️ أدخل مبلغًا صحيحًا ضمن الحدود المسموحة.", inline([nav_row("home", "🔙 إلغاء")]))
+            return True
+
+    if step == "dynamic_field":
+        key = flow.get("current_field")
+        if key == "proof_image":
+            set_panel(chat_id, "🧾 أرسل صورة إثبات التحويل.", inline([nav_row("home", "🔙 إلغاء")]))
+            return True
+        value = text.strip()
+        if not value and (flow.get("fields") or {}).get(key) == "required":
+            set_panel(chat_id, "⚠️ هذا الحقل مطلوب.", inline([nav_row("home", "🔙 إلغاء")]))
+            return True
+        if value:
+            flow["values"][key] = value
+        flow["step"] = "dynamic_field"
+        return bool(_dynamic_prompt_next(chat_id))
 
     if step == "ichancy_username":
         candidate = text.strip()
@@ -1845,6 +2112,15 @@ def handle_callback(query):
     elif data == "topup":
         flows.pop(chat_id, None)
         show_topup(chat_id)
+    elif data.startswith("dyn_dep:"):
+        _start_dynamic_payment(chat_id, data.split(":", 1)[1], "deposit")
+    elif data.startswith("dyn_wd:"):
+        _start_dynamic_payment(chat_id, data.split(":", 1)[1], "withdraw")
+    elif data.startswith("dyn_skip:"):
+        flow = flows.get(chat_id) or {}
+        if flow.get("step") == "dynamic_field" and flow.get("current_field"):
+            flow["values"].pop(flow["current_field"], None)
+            _dynamic_prompt_next(chat_id)
     elif data == "topup_sham":
         show_sham_cash_currency(chat_id)
     elif data == "topup_sham_syp":
@@ -1922,8 +2198,149 @@ def bridge_authorized(req):
 def admin_bridge_authorized(req):
     supplied = req.headers.get("X-Admin-Bridge-Key", "")
     return bool(ADMIN_BRIDGE_SHARED_SECRET) and hmac.compare_digest(supplied, ADMIN_BRIDGE_SHARED_SECRET)
+
+
+def financial_admin_actor(req):
+    """Return the authenticated service identity; caller-supplied actor headers are not trusted."""
+    if not admin_bridge_authorized(req):
+        return None
+    return {"actor_id": FINANCIAL_ADMIN_SERVICE_ID, "actor_type": "service_account"}
+
+
+def _financial_payload_hash(body):
+    canonical = json.dumps(body or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _claim_financial_idempotency(cur, operation_type, cash_request_id, key, actor_id, payload_hash):
+    key = str(key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,199}", key):
+        raise ValueError("invalid_idempotency_key")
+    cur.execute("""
+        SELECT idempotency_key,payload_hash,response_status,response_body,actor_id
+        FROM financial_idempotency
+        WHERE operation_type=%s AND cash_request_id=%s AND idempotency_key=%s
+        FOR UPDATE
+    """, (operation_type, cash_request_id, key))
+    existing = cur.fetchone()
+    if existing:
+        if existing["payload_hash"] != payload_hash:
+            raise ValueError("idempotency_key_payload_mismatch")
+        if existing["response_body"] is not None:
+            return existing["response_status"], dict(existing["response_body"]), True
+        return None, None, False
+    cur.execute("""
+        INSERT INTO financial_idempotency(operation_type,cash_request_id,idempotency_key,actor_id,payload_hash)
+        VALUES(%s,%s,%s,%s,%s)
+    """, (operation_type, cash_request_id, key, actor_id, payload_hash))
+    return None, None, False
+
+
+def _finish_financial_idempotency(cur, operation_type, cash_request_id, key, status_code, body):
+    cur.execute("""
+        UPDATE financial_idempotency
+        SET response_status=%s,response_body=%s,updated_at=NOW()
+        WHERE operation_type=%s AND cash_request_id=%s AND idempotency_key=%s
+          AND response_body IS NULL
+    """, (int(status_code), Json(body), operation_type, cash_request_id, key))
+    if cur.rowcount != 1:
+        raise RuntimeError("financial_idempotency_write_failed")
 def bridge_json_error(message, status=400):
     return jsonify({"ok": False, "error": message}), status
+
+
+def payment_storage():
+    global _PAYMENT_STORAGE
+    if _PAYMENT_STORAGE is None:
+        _PAYMENT_STORAGE = storage_from_environment()
+    return _PAYMENT_STORAGE
+
+
+def dynamic_payment_methods(direction):
+    if not db_enabled():
+        return []
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT m.id AS method_id,m.display_name,d.*,COALESCE((SELECT jsonb_object_agg(f.field_key,f.required_mode) FROM payment_method_fields f WHERE f.payment_method_direction_id=d.id),'{}'::jsonb) AS fields,a.id AS asset_id,a.storage_key AS asset_storage_key
+                   FROM payment_methods m JOIN payment_method_directions d ON d.payment_method_id=m.id AND d.direction=%s AND d.enabled=TRUE
+                   LEFT JOIN payment_assets a ON a.payment_method_id=m.id AND a.is_active=TRUE
+                   WHERE m.enabled=TRUE AND m.archived_at IS NULL ORDER BY m.sort_order,m.id""",
+                (direction,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def _dynamic_snapshot(method, direction):
+    keys = ("method_id", "display_name", "direction", "payment_currency", "reference_currency", "network", "account_name", "account_identifier", "instructions", "exchange_rate", "rate_definition", "conversion_multiplier", "fee_type", "fee_value", "bonus_enabled", "bonus_percent", "minimum_amount", "maximum_amount", "amount_scale", "asset_id")
+    snapshot = {key: method.get(key) for key in keys}
+    snapshot["direction"] = direction
+    snapshot["fields"] = method.get("fields") or {}
+    snapshot["method"] = method.get("display_name")
+    snapshot["currency"] = method.get("payment_currency")
+    snapshot["account_details"] = {
+        "name": method.get("account_name"),
+        "identifier": method.get("account_identifier"),
+    }
+    snapshot["fees"] = {"type": method.get("fee_type"), "value": method.get("fee_value")}
+    snapshot["bonus"] = {"enabled": method.get("bonus_enabled"), "percent": method.get("bonus_percent")}
+    snapshot["min"] = method.get("minimum_amount")
+    snapshot["max"] = method.get("maximum_amount")
+    snapshot["decimal_places"] = method.get("amount_scale")
+    return snapshot
+
+
+def create_dynamic_cash_request(chat_id, method, direction, values, attachment_content=None):
+    """Create request, snapshot, optional attachment and withdrawal reservation atomically."""
+    fields = method.get("fields") or {}
+    validate_dynamic_fields(fields, values)
+    request_values = dict(values)
+    operation_ref = None
+    if direction == "deposit" and fields.get("operation_reference") != "disabled":
+        operation_ref = normalize_operation_reference(request_values.get("operation_reference"))
+        request_values["operation_reference"] = operation_ref
+    snapshot = _dynamic_snapshot(method, direction)
+    quote = calculate_deposit_quote(request_values["amount"], snapshot) if direction == "deposit" else calculate_withdraw_quote(request_values["amount"], snapshot)
+    amount_bot = int(quote["bot_amount"] if direction == "deposit" else quote["input_bot_amount"])
+    request_type = "topup" if direction == "deposit" else "withdraw"
+    request_code = f"PAY-{uuid.uuid4().hex[:16].upper()}"
+    amount_original = Decimal(str(request_values["amount"]))
+
+    def json_safe(value):
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: json_safe(v) for k, v in value.items()}
+        return value
+    storage_key = None
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO cash_requests(request_code,telegram_id,request_type,amount_bot,amount_cash,method,status,details,payment_method_id,payment_direction,amount_original,conversion_snapshot)
+                       VALUES(%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s,%s,%s) RETURNING id""",
+                    (request_code, int(chat_id), request_type, amount_bot, int(amount_original), method["display_name"], Json(json_safe({"fields": request_values, **({"operation_ref": operation_ref} if operation_ref else {}), "quote": quote})), method["method_id"], direction, str(amount_original), Json(json_safe(snapshot))),
+                )
+                request_id = cur.fetchone()["id"]
+                snapshot_id = create_method_snapshot(cur, request_id, method["method_id"], method["id"], method.get("asset_id"), Json(json_safe(snapshot)))
+                cur.execute("UPDATE cash_requests SET method_snapshot_id=%s WHERE id=%s", (snapshot_id, request_id))
+                if attachment_content is not None:
+                    asset = validate_image(attachment_content)
+                    storage_key = f"cash-requests/{request_id}/{uuid.uuid4().hex}"
+                    payment_storage().upload(storage_key, asset.content, asset.content_type)
+                    cur.execute("""INSERT INTO cash_request_attachments(cash_request_id,storage_key,content_type,file_size,sha256)
+                                   VALUES(%s,%s,%s,%s,%s)""", (request_id, storage_key, asset.content_type, asset.size, asset.sha256))
+                if direction == "withdraw":
+                    reserve_withdrawal(cur, request_id, int(chat_id), amount_bot)
+        return {"ok": True, "request_code": request_code, "quote": quote, "request_id": request_id}
+    except Exception:
+        if storage_key:
+            try:
+                payment_storage().delete(storage_key)
+            except Exception:
+                pass
+        raise
 
 
 def enqueue_bridge_job(request_id, job_type, payload):
@@ -2031,7 +2448,7 @@ def enqueue_ichancy_deposit(chat_id, amount, operation_ref=None):
     if not operation_ref:
         operation_ref = str(uuid.uuid4())
     request_id = f"ichancy-deposit:{chat_id}:{operation_ref}"
-    ichancy_amount = amount * ICHANCY_UNITS_PER_BOT_UNIT
+    ichancy_amount = ichancy_deposit_units(amount)
     payload = {
         "telegram_id": int(chat_id),
         "player_id": player_id,
@@ -2080,7 +2497,7 @@ def enqueue_ichancy_balance(chat_id):
 
 
 def enqueue_ichancy_withdraw(chat_id, ichancy_amount, operation_ref=None):
-    """Queue an iChancy withdrawal; credit the bot only after bridge confirmation."""
+    """Queue the legacy iChancy withdrawal through the guarded reservation path."""
     if not db_enabled():
         return {"ok": False, "reason": "postgres_required"}
     ensure_db()
@@ -2089,9 +2506,10 @@ def enqueue_ichancy_withdraw(chat_id, ichancy_amount, operation_ref=None):
     if not player_id:
         return {"ok": False, "reason": "player_not_mapped"}
     ichancy_amount = int(ichancy_amount)
-    if ichancy_amount <= 0 or ichancy_amount % ICHANCY_UNITS_PER_BOT_UNIT:
+    try:
+        bot_amount = ichancy_withdraw_bot_units(ichancy_amount)
+    except ValueError:
         return {"ok": False, "reason": "invalid_conversion"}
-    bot_amount = ichancy_amount // ICHANCY_UNITS_PER_BOT_UNIT
     currency = str(user.get("ichancy_currency") or "USD").strip() or "USD"
     operation_ref = str(operation_ref or "").strip()
     if not operation_ref:
@@ -2102,24 +2520,57 @@ def enqueue_ichancy_withdraw(chat_id, ichancy_amount, operation_ref=None):
         "amount": ichancy_amount, "bot_amount": bot_amount,
         "currency_code": currency, "comment": f"Telegram withdrawal {chat_id}",
     }
-    job = enqueue_bridge_job(request_id, "withdraw", payload)
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id FROM transactions
-                WHERE tx_type='ichancy_withdraw' AND details->>'job_id'=%s
+                SELECT id, status, details, reservation_id
+                FROM cash_requests
+                WHERE telegram_id=%s AND request_type='withdraw'
+                  AND details->>'operation_ref'=%s
                 LIMIT 1
-            """, (str(job["job_id"]),))
-            if cur.fetchone():
-                return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id,
+            """, (int(chat_id), operation_ref))
+            existing = cur.fetchone()
+            if existing:
+                existing_details = existing["details"] or {}
+                existing_job_id = str(existing_details.get("job_id") or "").strip()
+                if not existing_job_id:
+                    return {"ok": False, "reason": "withdrawal_reconciliation_required"}
+                return {"ok": True, "job_id": existing_job_id, "request_id": request_id,
                         "bot_amount": bot_amount, "ichancy_amount": ichancy_amount}
-        add_transaction(
-            chat_id, "ichancy_withdraw", bot_amount, "pending", "bridge",
-            {"request_id": request_id, "job_id": str(job["job_id"]),
-             "player_id": player_id, "ichancy_amount": ichancy_amount,
-             "bot_amount": bot_amount, "conversion_rate": ICHANCY_UNITS_PER_BOT_UNIT},
-            None, None, conn=conn,
-        )
+
+            request_code = make_tx_code("IWD")
+            details = {
+                "request_id": request_id, "operation_ref": operation_ref,
+                "player_id": player_id, "ichancy_amount": ichancy_amount,
+                "bot_amount": bot_amount, "conversion_rate": ICHANCY_UNITS_PER_BOT_UNIT,
+            }
+            cur.execute("""
+                INSERT INTO cash_requests(
+                    request_code,telegram_id,request_type,amount_bot,amount_cash,
+                    method,status,details
+                ) VALUES(%s,%s,'withdraw',%s,%s,'ichancy','pending',%s)
+                RETURNING id
+            """, (request_code, int(chat_id), bot_amount, ichancy_amount, Json(details)))
+            cash_request_id = int(cur.fetchone()["id"])
+            reservation_id = reserve_withdrawal(cur, cash_request_id, int(chat_id), bot_amount)
+            payload["cash_request_id"] = cash_request_id
+            job_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO bridge_jobs(job_id,request_id,job_type,payload)
+                VALUES(%s,%s,'withdraw',%s)
+                RETURNING job_id,request_id,status
+            """, (job_id, request_id, Json(payload)))
+            job = dict(cur.fetchone())
+            add_transaction(
+                chat_id, "ichancy_withdraw", bot_amount, "pending", "bridge",
+                {**details, "job_id": job_id, "cash_request_id": cash_request_id,
+                 "reservation_id": reservation_id}, None, None, conn=conn,
+            )
+            cur.execute("""
+                UPDATE cash_requests
+                SET details=details || %s::jsonb, updated_at=NOW()
+                WHERE id=%s
+            """, (Json({"job_id": job_id}), cash_request_id))
     return {"ok": True, "job_id": str(job["job_id"]), "request_id": request_id,
             "bot_amount": bot_amount, "ichancy_amount": ichancy_amount}
 
@@ -2172,6 +2623,302 @@ def admin_bridge_players():
         status = 503 if result.get("reason") == "postgres_required" else 400
         return bridge_json_error(result["reason"], status)
     return jsonify(result), 202
+
+
+@app.route("/admin/v1/financial/cash-requests/<int:cash_request_id>/decision", methods=["POST"])
+def admin_financial_decision(cash_request_id):
+    """Record an admin decision without treating it as external success."""
+    actor = financial_admin_actor(request)
+    if not actor:
+        return bridge_json_error("unauthorized", 401)
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    body = request.get_json(silent=True) or {}
+    if set(body) - {"decision", "reason", "idempotency_key", "operation_ref"}:
+        return bridge_json_error("unsupported_fields")
+    decision = str(body.get("decision", "")).strip().lower()
+    reason = str(body.get("reason", "")).strip()
+    idem_key = str(body.get("idempotency_key", "")).strip()
+    if decision not in {"review", "approve", "reject", "start_payout", "confirm_deposit"}:
+        return bridge_json_error("invalid_decision")
+    if len(reason) < 3 or len(reason) > 1000:
+        return bridge_json_error("reason_required")
+    if decision == "confirm_deposit":
+        return bridge_json_error("external_verification_required", 409)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,request_type,status,telegram_id,reservation_id FROM cash_requests WHERE id=%s FOR UPDATE", (cash_request_id,))
+            item = cur.fetchone()
+            if not item:
+                return bridge_json_error("cash_request_not_found", 404)
+            # The key is scoped to the request and financial decision operation;
+            # changing the decision with the same key must be rejected.
+            operation_type = "admin_financial_decision"
+            try:
+                replay_status, replay_body, replay = _claim_financial_idempotency(
+                    cur, operation_type, cash_request_id, idem_key, actor["actor_id"], _financial_payload_hash(body)
+                )
+            except ValueError as exc:
+                error_code = _safe_public_error(exc, "financial_idempotency_rejected")
+                return bridge_json_error(error_code, 409 if "mismatch" in error_code else 400)
+            if replay:
+                return jsonify(replay_body), int(replay_status)
+            previous = item["status"]
+            try:
+                if decision == "review":
+                    new_status = previous
+                elif item["request_type"] == "topup":
+                    if decision == "approve" and previous == "pending":
+                        cur.execute("UPDATE cash_requests SET status='approved',updated_at=NOW() WHERE id=%s AND status='pending'", (cash_request_id,))
+                        new_status = "approved"
+                    elif decision == "reject" and previous in {"pending", "approved"}:
+                        cur.execute("UPDATE cash_requests SET status='rejected',updated_at=NOW() WHERE id=%s AND status IN ('pending','approved')", (cash_request_id,))
+                        new_status = "rejected"
+                    else:
+                        raise ValueError("invalid_topup_transition")
+                else:
+                    if decision == "approve":
+                        approve_withdrawal(cur, cash_request_id)
+                        new_status = "approved"
+                    elif decision == "start_payout":
+                        start_withdrawal_payout(cur, cash_request_id)
+                        new_status = "payout_in_progress"
+                    elif decision == "reject" and previous == "pending":
+                        cur.execute("UPDATE cash_requests SET status='rejected',updated_at=NOW() WHERE id=%s AND status='pending'", (cash_request_id,))
+                        new_status = "rejected"
+                    else:
+                        raise ValueError("invalid_withdraw_transition")
+                record_financial_audit(cur, actor["actor_id"], actor["actor_type"], "admin_decision",
+                                       cash_request_id, item["request_type"], previous, new_status,
+                                       decision, reason, body.get("operation_ref"), None,
+                                       {"idempotency_key": idem_key})
+                response = {"ok": True, "cash_request_id": cash_request_id, "decision": decision,
+                            "status": new_status, "external_outcome": "not_confirmed"}
+                _finish_financial_idempotency(cur, operation_type, cash_request_id, idem_key, 200, response)
+                return jsonify(response)
+            except ValueError as exc:
+                conn.rollback()
+                return bridge_json_error(_safe_public_error(exc, "financial_transition_rejected"), 409)
+
+
+@app.route("/admin/v1/financial/cash-requests/<int:cash_request_id>/external-outcome", methods=["POST"])
+def admin_financial_external_outcome(cash_request_id):
+    """Manual admin evidence cannot certify an external result."""
+    if not financial_admin_actor(request):
+        return bridge_json_error("unauthorized", 401)
+    return bridge_json_error("external_verification_required", 409)
+
+
+def _payment_admin_payload_valid(body, require_direction=False):
+    """Strict validation for admin payment configuration; no production defaults."""
+    if not isinstance(body, dict):
+        return "invalid_json"
+    if require_direction:
+        direction = str(body.get("direction", "")).strip().lower()
+        if direction not in {"deposit", "withdraw"}:
+            return "invalid_direction"
+        definition = str(body.get("rate_definition", "")).strip()
+        if len(definition) < 8 or not any(x in definition.lower() for x in (" per ", " per", "/", "لكل", "مقابل")):
+            return "rate_definition_must_describe_units"
+        try:
+            rate = Decimal(str(body.get("rate")))
+            multiplier = Decimal(str(body.get("conversion_multiplier", 1)))
+            minimum = Decimal(str(body.get("minimum_amount", 0)))
+            maximum = body.get("maximum_amount")
+            maximum = None if maximum in (None, "") else Decimal(str(maximum))
+            fee = Decimal(str(body.get("fee_value", 0)))
+            bonus = Decimal(str(body.get("bonus_percent", 0)))
+        except (InvalidOperation, TypeError, ValueError):
+            return "invalid_numeric_config"
+        if rate <= 0 or multiplier <= 0 or minimum < 0 or (maximum is not None and maximum < minimum):
+            return "invalid_limits_or_rate"
+        fee_type = str(body.get("fee_type", "none")).lower()
+        if fee < 0 or fee_type not in {"none", "fixed", "percent"} or (fee_type == "percent" and fee > 100):
+            return "invalid_fee"
+        if bonus < 0 or bonus > 1000:
+            return "invalid_bonus"
+        fields = body.get("fields", {}) or {}
+        allowed_fields = {"amount", "operation_reference", "proof_image", "note", "recipient_account", "recipient_name", "network"}
+        if not isinstance(fields, dict) or any(k not in allowed_fields or v not in {"required", "optional", "disabled"} for k, v in fields.items()):
+            return "invalid_payment_fields"
+    return None
+
+
+def _payment_audit_safe(value):
+    if not isinstance(value, dict):
+        return {}
+    clean = dict(value)
+    for key in ("password", "token", "access_token", "refresh_token", "cookie", "secret"):
+        if key in clean:
+            clean[key] = "[redacted]"
+    return clean
+
+
+@app.route("/admin/v1/payment-methods", methods=["GET", "POST"])
+def admin_payment_methods():
+    if not admin_bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    ensure_db()
+    if request.method == "GET":
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT m.*, COALESCE(jsonb_agg(to_jsonb(d) ORDER BY d.direction)
+                        FILTER (WHERE d.id IS NOT NULL), '[]'::jsonb) AS directions
+                    FROM payment_methods m
+                    LEFT JOIN payment_method_directions d ON d.payment_method_id=m.id
+                    GROUP BY m.id ORDER BY m.sort_order,m.id
+                """)
+                return jsonify({"ok": True, "methods": [dict(row) for row in cur.fetchall()]})
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action", "")).strip().lower()
+    if action == "create":
+        key = str(body.get("method_key", "")).strip().lower()
+        name = str(body.get("display_name", "")).strip()
+        if not re.fullmatch(r"[a-z0-9_-]{2,80}", key) or not name:
+            return bridge_json_error("invalid_method")
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO payment_methods(method_key,display_name) VALUES(%s,%s) RETURNING id", (key, name))
+                method_id = cur.fetchone()["id"]
+                audit("payment_method_create", method_id, {"method_key": key, "display_name": name}, conn=conn)
+        return jsonify({"ok": True, "method_id": method_id}), 201
+    return bridge_json_error("unsupported_action")
+
+
+@app.route("/admin/v1/payment-methods/<int:method_id>", methods=["PATCH"])
+def admin_payment_method_update(method_id):
+    if not admin_bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    body = request.get_json(silent=True) or {}
+    if set(body) - {"display_name", "enabled", "archived"}:
+        return bridge_json_error("unsupported_fields")
+    if not any(key in body for key in ("display_name", "enabled", "archived")):
+        return bridge_json_error("no_changes")
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM payment_methods WHERE id=%s FOR UPDATE", (method_id,))
+            old = cur.fetchone()
+            if not old:
+                return bridge_json_error("payment_method_not_found", 404)
+            if "archived" in body and body["archived"]:
+                cur.execute("UPDATE payment_methods SET archived_at=COALESCE(archived_at,NOW()),enabled=FALSE,updated_at=NOW() WHERE id=%s RETURNING *", (method_id,))
+            else:
+                cur.execute("UPDATE payment_methods SET display_name=COALESCE(%s,display_name),enabled=COALESCE(%s,enabled),updated_at=NOW() WHERE id=%s RETURNING *", (body.get("display_name"), body.get("enabled"), method_id))
+            new = cur.fetchone()
+            audit("payment_method_update", method_id, {"old": _payment_audit_safe(dict(old)), "new": _payment_audit_safe(dict(new))}, conn=conn)
+            return jsonify({"ok": True, "method": dict(new)})
+
+
+@app.route("/admin/v1/payment-methods/<int:method_id>/directions", methods=["PUT"])
+def admin_payment_method_direction(method_id):
+    if not admin_bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    invalid = _payment_admin_payload_valid(body, require_direction=True)
+    if invalid:
+        return bridge_json_error(invalid)
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,archived_at FROM payment_methods WHERE id=%s FOR UPDATE", (method_id,))
+            method = cur.fetchone()
+            if not method or method["archived_at"]:
+                return bridge_json_error("payment_method_not_found_or_archived", 404)
+            cur.execute("SELECT * FROM payment_method_directions WHERE payment_method_id=%s AND direction=%s", (method_id, body["direction"]))
+            old = cur.fetchone()
+            cur.execute("""
+                INSERT INTO payment_method_directions(payment_method_id,direction,payment_currency,reference_currency,network,account_name,account_identifier,instructions,exchange_rate,rate_definition,conversion_multiplier,fee_type,fee_value,bonus_enabled,bonus_percent,minimum_amount,maximum_amount,amount_scale)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(payment_method_id,direction) DO UPDATE SET payment_currency=EXCLUDED.payment_currency,reference_currency=EXCLUDED.reference_currency,network=EXCLUDED.network,account_name=EXCLUDED.account_name,account_identifier=EXCLUDED.account_identifier,instructions=EXCLUDED.instructions,exchange_rate=EXCLUDED.exchange_rate,rate_definition=EXCLUDED.rate_definition,conversion_multiplier=EXCLUDED.conversion_multiplier,fee_type=EXCLUDED.fee_type,fee_value=EXCLUDED.fee_value,bonus_enabled=EXCLUDED.bonus_enabled,bonus_percent=EXCLUDED.bonus_percent,minimum_amount=EXCLUDED.minimum_amount,maximum_amount=EXCLUDED.maximum_amount,amount_scale=EXCLUDED.amount_scale,updated_at=NOW()
+                RETURNING *
+            """, (method_id,body["direction"],body.get("payment_currency",""),body.get("reference_currency",""),body.get("network"),body.get("account_name"),body.get("account_identifier"),body.get("instructions"),body["rate"],body["rate_definition"],body.get("conversion_multiplier",1),body.get("fee_type","none"),body.get("fee_value",0),bool(body.get("bonus_enabled",False)),body.get("bonus_percent",0),body.get("minimum_amount",0),body.get("maximum_amount") or None,int(body.get("decimal_places",body.get("amount_scale",0)))))
+            new = cur.fetchone()
+            cur.execute("DELETE FROM payment_method_fields WHERE payment_method_direction_id=%s", (new["id"],))
+            for field_key, mode in (body.get("fields") or {}).items():
+                cur.execute("INSERT INTO payment_method_fields(payment_method_direction_id,field_key,required_mode) VALUES(%s,%s,%s)", (new["id"],field_key,mode))
+            audit("payment_method_direction_update", method_id, {"direction": body["direction"], "old": _payment_audit_safe(dict(old) if old else {}), "new": _payment_audit_safe(dict(new))}, conn=conn)
+            return jsonify({"ok": True, "direction": dict(new)})
+
+
+@app.route("/admin/v1/payment-methods/<int:method_id>/asset", methods=["GET", "POST", "DELETE"])
+def admin_payment_method_asset(method_id):
+    if not admin_bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
+    if not db_enabled():
+        return bridge_json_error("postgres_required", 503)
+    ensure_db()
+    if request.method == "GET":
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id,storage_key,content_type,file_size,sha256,retention_status FROM payment_assets WHERE payment_method_id=%s AND is_active=TRUE ORDER BY created_at DESC LIMIT 1", (method_id,))
+                asset = cur.fetchone()
+                if not asset:
+                    return bridge_json_error("payment_asset_not_found", 404)
+                try:
+                    url = payment_storage().presign(asset["storage_key"], 300)
+                except Exception:
+                    return bridge_json_error("private_storage_unavailable", 503)
+                return jsonify({"ok": True, "asset": {**dict(asset), "temporary_url": url, "expires_seconds": 300}})
+    confirm = str(request.form.get("confirm", "")).lower() in {"1", "true", "yes", "replace", "delete"}
+    if request.method == "DELETE":
+        if not confirm:
+            return bridge_json_error("confirmation_required")
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute("SELECT id FROM payment_assets WHERE payment_method_id=%s AND is_active=TRUE ORDER BY created_at DESC LIMIT 1", (method_id,))
+                    asset = cur.fetchone()
+                    if not asset:
+                        return bridge_json_error("payment_asset_not_found", 404)
+                    result = mark_asset_deleted(cur, payment_storage(), asset["id"])
+                    audit("payment_asset_delete", method_id, {"asset_id": asset["id"], "retention_status": result["status"]}, conn=conn)
+                    return jsonify({"ok": True, "asset": {"asset_id": result["asset_id"], "status": result["status"]}})
+                except Exception:
+                    conn.rollback()
+                    return bridge_json_error("payment_asset_delete_failed", 500)
+    image = request.files.get("image")
+    if not image:
+        return bridge_json_error("image_required")
+    if request.content_length and request.content_length > MAX_ASSET_BYTES + 256 * 1024:
+        return bridge_json_error("image_too_large", 413)
+    content = image.read()
+    if len(content) > MAX_ASSET_BYTES:
+        return bridge_json_error("image_too_large", 413)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM payment_assets WHERE payment_method_id=%s AND is_active=TRUE ORDER BY created_at DESC LIMIT 1", (method_id,))
+            old = cur.fetchone()
+            if old and not confirm:
+                return bridge_json_error("replacement_confirmation_required", 409)
+            new_key = None
+            try:
+                new_asset_id, new_key, validated = upload_payment_asset(cur, payment_storage(), method_id, content)
+                if old:
+                    retired = retire_asset(cur, payment_storage(), old["id"])
+                    audit("payment_asset_replace", method_id, {"old_asset_id": old["id"], "old_status": retired["status"], "new_asset_id": new_asset_id, "sha256": validated.sha256}, conn=conn)
+                else:
+                    audit("payment_asset_upload", method_id, {"asset_id": new_asset_id, "sha256": validated.sha256, "content_type": validated.content_type}, conn=conn)
+                return jsonify({"ok": True, "asset": {"asset_id": new_asset_id, "content_type": validated.content_type, "file_size": validated.size, "sha256": validated.sha256}}), 201
+            except ValueError as exc:
+                conn.rollback()
+                return bridge_json_error(_safe_public_error(exc, "payment_asset_invalid"), 400)
+            except Exception:
+                conn.rollback()
+                if new_key:
+                    try:
+                        payment_storage().delete(new_key)
+                    except Exception:
+                        pass
+                return bridge_json_error("payment_asset_upload_failed", 500)
 
 
 @app.route("/bridge/v1/jobs/next", methods=["POST"])
@@ -2262,6 +3009,7 @@ def bridge_next_job():
                            execution_attempt_id::text AS execution_attempt_id
                     FROM bridge_jobs
                     WHERE status='pending' AND job_type = ANY(%s)
+                      AND NOT (job_type='withdraw' AND NOT (payload ? 'cash_request_id'))
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -2272,14 +3020,59 @@ def bridge_next_job():
                            execution_attempt_id::text AS execution_attempt_id
                     FROM bridge_jobs
                     WHERE status='pending'
+                      AND NOT (job_type='withdraw' AND NOT (payload ? 'cash_request_id'))
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 """)
             row = cur.fetchone()
             if not row:
+                legacy_filter = "job_type = ANY(%s)" if requested_types else "TRUE"
+                params = (requested_types,) if requested_types else ()
+                cur.execute(
+                    f"SELECT 1 FROM bridge_jobs WHERE status='pending' AND {legacy_filter} "
+                    "AND job_type='withdraw' AND NOT (payload ? 'cash_request_id') LIMIT 1",
+                    params,
+                )
+                if cur.fetchone():
+                    return bridge_json_error("withdrawal_reconciliation_required", 409)
                 return jsonify({"ok": True, "job": None})
+            if row["job_type"] == "withdraw" and not int((row.get("payload") or {}).get("cash_request_id") or 0):
+                return bridge_json_error("withdrawal_reconciliation_required", 409)
             if row["job_type"] in {"deposit", "withdraw"}:
+                if row["job_type"] == "withdraw":
+                    cash_request_id = int((row.get("payload") or {}).get("cash_request_id") or 0)
+                    cur.execute("""
+                        SELECT cr.status AS request_status,
+                               cr.reservation_id,
+                               br.status AS reservation_status,
+                               br.external_outcome
+                        FROM cash_requests cr
+                        LEFT JOIN balance_reservations br
+                          ON br.id=cr.reservation_id AND br.cash_request_id=cr.id
+                        WHERE cr.id=%s AND cr.request_type='withdraw'
+                        FOR UPDATE OF cr
+                    """, (cash_request_id,))
+                    withdrawal = cur.fetchone()
+                    if not withdrawal:
+                        return bridge_json_error("withdraw_request_not_found", 409)
+                    if withdrawal["request_status"] != "approved":
+                        return bridge_json_error("withdrawal_admin_approval_required", 409)
+                    if (not withdrawal["reservation_id"]
+                            or withdrawal["reservation_status"] != "held"
+                            or withdrawal["external_outcome"] != "unknown_external_result"):
+                        return bridge_json_error("withdrawal_reservation_not_held", 409)
+                    cur.execute("""
+                        SELECT 1
+                        FROM bridge_jobs
+                        WHERE job_id<>%s
+                          AND job_type='withdraw'
+                          AND status IN ('pending','running')
+                          AND payload->>'cash_request_id'=%s
+                        LIMIT 1
+                    """, (row["job_id"], str(cash_request_id)))
+                    if cur.fetchone():
+                        return bridge_json_error("withdrawal_job_already_active", 409)
                 attempt_id = str(uuid.uuid4())
                 cur.execute("""
                     UPDATE bridge_jobs
@@ -2296,6 +3089,8 @@ def bridge_next_job():
                 if not claimed:
                     return jsonify({"ok": True, "job": None})
                 row["execution_attempt_id"] = claimed["execution_attempt_id"]
+                if row["job_type"] == "withdraw":
+                    start_withdrawal_payout(cur, cash_request_id)
             else:
                 cur.execute("""
                     UPDATE bridge_jobs
@@ -2334,6 +3129,12 @@ def bridge_complete_job(job_id):
     accepted_completion = False
     with db_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT job_type,payload FROM bridge_jobs WHERE job_id=%s FOR UPDATE", (job_id,))
+            existing_job = cur.fetchone()
+            if not existing_job:
+                return bridge_json_error("job_not_found", 404)
+            if existing_job["job_type"] == "withdraw" and not int((existing_job["payload"] or {}).get("cash_request_id") or 0):
+                return bridge_json_error("withdrawal_reconciliation_required", 409)
             if execution_attempt_id:
                 completion_sql = """
                     UPDATE bridge_jobs
@@ -2413,7 +3214,31 @@ def bridge_complete_job(job_id):
                 if telegram_id:
                     cur.execute("SAVEPOINT financial_settlement")
                     try:
-                        if status == "unknown_external_result":
+                        if kind == "withdraw":
+                            cash_request_id = int(payload.get("cash_request_id") or 0)
+                            if not cash_request_id:
+                                raise RuntimeError("withdrawal_reconciliation_required")
+                            if status == "unknown_external_result":
+                                mark_withdrawal_unknown(cur, cash_request_id, str(body.get("error") or "external outcome unknown"))
+                                tx_final_status = "unknown_external_result"
+                            elif status == "succeeded":
+                                external_reference = str((body.get("result") or {}).get("external_reference") or "").strip() or None
+                                record_external_outcome(cur, cash_request_id, "external_confirmed_success", external_reference)
+                                settle_withdrawal(cur, cash_request_id, external_reference)
+                                tx_final_status = "completed"
+                            else:
+                                record_external_outcome(cur, cash_request_id, "external_confirmed_failure")
+                                release_withdrawal(cur, cash_request_id, "failed")
+                                tx_final_status = "failed"
+                            cur.execute("""
+                                UPDATE transactions SET status=%s
+                                WHERE telegram_id=%s AND tx_type='ichancy_withdraw'
+                                  AND details->>'job_id'=%s
+                                  AND status IN ('pending','unknown_external_result')
+                            """, (tx_final_status, int(telegram_id), str(job_id)))
+                            if cur.rowcount != 1:
+                                raise RuntimeError("withdrawal_transaction_rowcount")
+                        elif status == "unknown_external_result":
                             cur.execute("""
                                 UPDATE transactions SET status='unknown_external_result',
                                     details=details || jsonb_build_object('reconciliation_required', TRUE)
@@ -2454,7 +3279,8 @@ def bridge_complete_job(job_id):
                     except Exception as settlement_error:
                         cur.execute("ROLLBACK TO SAVEPOINT financial_settlement")
                         if status == "succeeded":
-                            reconciliation_error = f"external_succeeded_local_settlement_failed:{settlement_error}"[:500]
+                            trace_id = _safe_exception_metadata("financial.settlement", settlement_error)
+                            reconciliation_error = f"external_succeeded_local_settlement_failed:trace={trace_id}"[:500]
                             cur.execute("""
                                 UPDATE bridge_jobs
                                 SET status='external_succeeded_reconciliation_required',
@@ -2483,13 +3309,11 @@ def bridge_complete_job(job_id):
             if error == "username_taken":
                 message = "⚠️ <b>اسم المستخدم مستخدم من قبل.</b>\n\nيرجى اختيار اسم مستخدم إنكليزي جديد مع أرقام، مثل: <code>Ahmad129</code>."
             elif error.startswith("register_player_http_"):
-                detail = error.removeprefix("register_player_http_").replace("_", " ")
-                message = f"⚠️ <b>رفض iChancy إنشاء الحساب.</b>\n\nالرد: <code>{html.escape(detail)}</code>\n\nلم يتم اعتماد الحساب. تأكد من صلاحية Agent الأب ثم أعد المحاولة."
+                message = "⚠️ <b>تعذر إنشاء حساب iChancy حاليًا.</b>\n\nلم يتم اعتماد الحساب، ولم تُعرض تفاصيل الاتصال الخارجية. أعد المحاولة لاحقًا."
             elif error == "registration_timeout_45s":
-                message = "⚠️ <b>لم ترد صفحة iChancy خلال 45 ثانية.</b>\n\nلم يتم اعتماد الحساب. افتح صفحة iChancy يدويًا على الهاتف، أكمل أي تحقق ظاهر، ثم أعد المحاولة."
+                message = "⚠️ <b>انتهت مهلة إنشاء الحساب.</b>\n\nلم يتم اعتماد الحساب. أعد المحاولة لاحقًا بعد التأكد من جاهزية الجسر."
             elif error.startswith("registration_runtime_error:"):
-                detail = error.split(":", 1)[1].strip()
-                message = f"⚠️ <b>توقف تنفيذ إنشاء الحساب داخل Bridge.</b>\n\nالتفصيل التقني: <code>{html.escape(detail[:180])}</code>"
+                message = "⚠️ <b>تعذر إنشاء حساب iChancy حاليًا.</b>\n\nلم يتم اعتماد الحساب، ولم تُعرض تفاصيل الاتصال الخارجية. أعد المحاولة لاحقًا."
             else:
                 message = "⚠️ <b>لم يكتمل إنشاء حساب iChancy.</b>\n\nلم يتم إنشاء حساب جديد. اختر اسم مستخدم آخر أو أعد المحاولة لاحقًا."
             set_panel(int(chat_id), message, inline([[cb("🔁 اختيار اسم آخر", "ichancy_create")], nav_row("account")]))
@@ -2502,24 +3326,21 @@ def bridge_complete_job(job_id):
             currency = html.escape(str(result.get("currency") or payload.get("currency_code") or ""))
             set_panel(int(chat_id), f"✅ <b>تم تحديث الرصيد من iChancy</b>\n\n💰 الرصيد الحالي: <b>{balance} {currency}</b>", inline([nav_row("account")]))
         elif chat_id:
-            error = html.escape(str(body.get("error") or "تعذر جلب الرصيد")[:180])
-            set_panel(int(chat_id), f"⚠️ <b>تعذر تحديث الرصيد</b>\n\nالسبب: <code>{error}</code>", inline([nav_row("account")]))
+            set_panel(int(chat_id), _customer_job_outcome_message("get_balance", status), inline([nav_row("account")]))
     elif accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
         payload = completed_job.get("payload") or {}
         chat_id = payload.get("telegram_id")
         if chat_id and status == "succeeded":
             set_panel(int(chat_id), "✅ <b>تم شحن حساب iChancy بنجاح</b>\n\nتم تأكيد العملية من iChancy وخصم المبلغ من رصيدك.", inline([nav_row("home")]))
         elif chat_id:
-            error = html.escape(str(body.get("error") or "تعذر تنفيذ العملية")[:180])
-            set_panel(int(chat_id), f"⚠️ <b>لم يكتمل شحن حساب iChancy</b>\n\nالسبب: <code>{error}</code>\n\nلم يتم خصم المبلغ من رصيدك.", inline([nav_row("home")]))
+            set_panel(int(chat_id), _customer_job_outcome_message("deposit", status), inline([nav_row("home")]))
     elif accepted_completion and completed_job and completed_job.get("job_type") == "withdraw":
         payload = completed_job.get("payload") or {}
         chat_id = payload.get("telegram_id")
         if chat_id and status == "succeeded":
             set_panel(int(chat_id), "✅ <b>تم سحب الرصيد من iChancy بنجاح</b>\n\nتم تأكيد العملية وإضافة الرصيد المحول إلى رصيد البوت.", inline([nav_row("home")]))
         elif chat_id:
-            error = html.escape(str(body.get("error") or "تعذر تنفيذ العملية")[:180])
-            set_panel(int(chat_id), f"⚠️ <b>لم يكتمل سحب iChancy</b>\n\nالسبب: <code>{error}</code>\n\nلم تتم إضافة أي رصيد إلى البوت.", inline([nav_row("home")]))
+            set_panel(int(chat_id), _customer_job_outcome_message("withdraw", status), inline([nav_row("home")]))
     return jsonify({"ok": True, "job": dict(row)})
 
 
@@ -2616,19 +3437,19 @@ def webhook():
         try:
             handle_callback(query)
         except Exception as exc:
-            print("Callback error:", repr(exc), flush=True)
-            traceback.print_exc()
+            _safe_exception_metadata("webhook.callback", exc)
             callback_id = query.get("id")
             if callback_id:
                 answer_callback(callback_id, "⚠️ حدث خطأ مؤقت، حاول مرة ثانية.", True)
         finally:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
-            print(f"callback {query.get('data','')} {elapsed_ms}ms", flush=True)
+            print(f"callback handled=1 elapsed_ms={elapsed_ms}", flush=True)
         return jsonify({"ok": True})
 
     message = update.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
     text = message.get("text", "")
+    photo = message.get("photo") or []
     message_id = message.get("message_id")
     if not chat_id:
         return jsonify({"ok": True})
@@ -2660,6 +3481,16 @@ def webhook():
         return jsonify({"ok": True})
 
     try:
+        active_flow = flows.get(chat_id) or load_persistent_flow(chat_id) or {}
+        if photo and active_flow.get("step") == "dynamic_field" and active_flow.get("current_field") == "proof_image":
+            try:
+                active_flow["attachment_content"] = download_telegram_photo(photo)
+                active_flow["values"]["proof_image"] = "attached"
+                flows[chat_id] = active_flow
+                _dynamic_prompt_next(chat_id)
+            except Exception:
+                set_panel(chat_id, "⚠️ تعذر استلام صورة الإثبات. أرسل صورة واضحة من فضلك.", inline([nav_row("home", "🔙 إلغاء")]))
+            return jsonify({"ok": True})
         if process_text_input(chat_id, text):
             if message_id:
                 delete_message(chat_id, message_id)
@@ -2674,8 +3505,7 @@ def webhook():
         if message_id:
             delete_message(chat_id, message_id)
     except Exception as exc:
-        print("Message handler error:", repr(exc), flush=True)
-        traceback.print_exc()
+        _safe_exception_metadata("webhook.message", exc)
         send_message(chat_id, "⚠️ حدث خطأ مؤقت، حاول مرة ثانية.")
 
     return jsonify({"ok": True})
@@ -2683,20 +3513,21 @@ def webhook():
 
 @app.route("/diagnostics")
 def diagnostics():
-    wh = tg("getWebhookInfo", timeout=5)
-    result = wh.get("result") or {} if isinstance(wh, dict) else {}
+    if not admin_bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
     return jsonify({
         "ok": True,
         "version": "v18-sham-syp-qr-request",
         "db": "postgres" if db_enabled() else "memory",
         "sham_qr": os.path.exists(SHAM_SYP_QR_PATH),
-        "webhook_pending_updates": result.get("pending_update_count"),
-        "last_webhook_error": result.get("last_error_message"),
+        "telegram_queried": False,
     })
 
 
 @app.route("/set-webhook")
 def set_webhook():
+    if not admin_bridge_authorized(request):
+        return bridge_json_error("unauthorized", 401)
     ensure_native_menu()
     response = tg("setWebhook", {
         "url": f"{PUBLIC_BASE_URL}/webhook",
