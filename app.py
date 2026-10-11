@@ -1081,13 +1081,32 @@ def _safe_public_error(exc, fallback):
     return fallback
 
 
-def _customer_job_outcome_message(job_type, status):
+def _customer_job_outcome_message(job_type, status, provider_error=""):
     """Return customer-safe status text; never expose Bridge/provider error text."""
+    provider_error = str(provider_error or "").lower()
     if job_type == "deposit":
+        if status == "failed" and (
+                "total available" in provider_error
+                or "amount is greater than you have" in provider_error
+        ):
+            return (
+                "⚠️ <b>رفض iChancy عملية الشحن</b>\n\n"
+                "رصيد المصدر المتاح لدى الوكيل غير كافٍ لهذا المبلغ. "
+                "لم يُخصم أي مبلغ من رصيدك في البوت. جرّب مبلغًا أصغر أو تواصل مع الإدارة لتعبئة رصيد المصدر."
+            )
+        if status == "failed" and "min deposit" in provider_error:
+            return (
+                "⚠️ <b>المبلغ أقل من الحد الأدنى لشحن iChancy</b>\n\n"
+                "لم يُخصم أي مبلغ من رصيدك في البوت. استخدم مبلغًا يساوي أو يتجاوز الحد الأدنى."
+            )
         if status == "unknown_external_result":
             return "⚠️ <b>نتيجة شحن حساب iChancy غير محسومة حاليًا</b>\n\nتم إيقاف إعادة التنفيذ تلقائيًا، ولم يُخصم المبلغ حتى تُحسم النتيجة بالمصالحة."
         return "⚠️ <b>لم يكتمل شحن حساب iChancy</b>\n\nلم يتم خصم المبلغ من رصيدك. يمكنك المحاولة لاحقًا بعد التأكد من جاهزية الجسر."
     if job_type == "withdraw":
+        if status == "failed" and "amount is greater than account balance" in provider_error:
+            return "⚠️ <b>رصيد حساب iChancy غير كافٍ للسحب</b>\n\nلم تتم إضافة أي رصيد إلى البوت."
+        if status == "failed" and "min withdrawal" in provider_error:
+            return "⚠️ <b>المبلغ أقل من الحد الأدنى لسحب iChancy</b>\n\nلم تتم إضافة أي رصيد إلى البوت."
         if status == "unknown_external_result":
             return "⚠️ <b>نتيجة سحب iChancy غير محسومة حاليًا</b>\n\nتم تعليق العملية وإحالتها إلى المصالحة، ولم تتم إضافة أي رصيد إلى البوت أو إعادة تنفيذ السحب تلقائيًا."
         return "⚠️ <b>لم يكتمل سحب iChancy</b>\n\nلم تتم إضافة أي رصيد إلى البوت. يمكنك المحاولة لاحقًا بعد التأكد من جاهزية الجسر."
@@ -3364,21 +3383,21 @@ def bridge_complete_job(job_id):
             currency = html.escape(str(result.get("currency") or payload.get("currency_code") or ""))
             set_panel(int(chat_id), f"✅ <b>تم تحديث الرصيد من iChancy</b>\n\n💰 الرصيد الحالي: <b>{balance} {currency}</b>", inline([nav_row("account")]))
         elif chat_id:
-            set_panel(int(chat_id), _customer_job_outcome_message("get_balance", status), inline([nav_row("account")]))
+            set_panel(int(chat_id), _customer_job_outcome_message("get_balance", status, body.get("error")), inline([nav_row("account")]))
     elif accepted_completion and completed_job and completed_job.get("job_type") == "deposit":
         payload = completed_job.get("payload") or {}
         chat_id = payload.get("telegram_id")
         if chat_id and status == "succeeded":
             set_panel(int(chat_id), "✅ <b>تم شحن حساب iChancy بنجاح</b>\n\nتم تأكيد العملية من iChancy وخصم المبلغ من رصيدك.", inline([nav_row("home")]))
         elif chat_id:
-            set_panel(int(chat_id), _customer_job_outcome_message("deposit", status), inline([nav_row("home")]))
+            set_panel(int(chat_id), _customer_job_outcome_message("deposit", status, body.get("error")), inline([nav_row("home")]))
     elif accepted_completion and completed_job and completed_job.get("job_type") == "withdraw":
         payload = completed_job.get("payload") or {}
         chat_id = payload.get("telegram_id")
         if chat_id and status == "succeeded":
             set_panel(int(chat_id), "✅ <b>تم سحب الرصيد من iChancy بنجاح</b>\n\nتم تأكيد العملية وإضافة الرصيد المحول إلى رصيد البوت.", inline([nav_row("home")]))
         elif chat_id:
-            set_panel(int(chat_id), _customer_job_outcome_message("withdraw", status), inline([nav_row("home")]))
+            set_panel(int(chat_id), _customer_job_outcome_message("withdraw", status, body.get("error")), inline([nav_row("home")]))
     return jsonify({"ok": True, "job": dict(row)})
 
 
