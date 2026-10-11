@@ -51,6 +51,8 @@ from payment_schema import (
     record_financial_audit,
     record_external_verification,
     settle_topup_after_verification,
+    settle_topup_by_admin,
+    settle_withdrawal_by_admin,
 )
 
 app = Flask(__name__)
@@ -2648,7 +2650,7 @@ def admin_bridge_players():
 
 @app.route("/admin/v1/financial/cash-requests/<int:cash_request_id>/decision", methods=["POST"])
 def admin_financial_decision(cash_request_id):
-    """Record an admin decision without treating it as external success."""
+    """Apply the authorized admin's final cash settlement decision atomically."""
     actor = financial_admin_actor(request)
     if not actor:
         return bridge_json_error("unauthorized", 401)
@@ -2660,12 +2662,10 @@ def admin_financial_decision(cash_request_id):
     decision = str(body.get("decision", "")).strip().lower()
     reason = str(body.get("reason", "")).strip()
     idem_key = str(body.get("idempotency_key", "")).strip()
-    if decision not in {"review", "approve", "reject", "start_payout", "confirm_deposit"}:
+    if decision not in {"review", "approve", "reject", "start_payout"}:
         return bridge_json_error("invalid_decision")
     if len(reason) < 3 or len(reason) > 1000:
         return bridge_json_error("reason_required")
-    if decision == "confirm_deposit":
-        return bridge_json_error("external_verification_required", 409)
     ensure_db()
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -2690,9 +2690,9 @@ def admin_financial_decision(cash_request_id):
                 if decision == "review":
                     new_status = previous
                 elif item["request_type"] == "topup":
-                    if decision == "approve" and previous == "pending":
-                        cur.execute("UPDATE cash_requests SET status='approved',updated_at=NOW() WHERE id=%s AND status='pending'", (cash_request_id,))
-                        new_status = "approved"
+                    if decision == "approve" and previous in {"pending", "approved"}:
+                        settle_topup_by_admin(cur, cash_request_id, actor["actor_id"], reason)
+                        new_status = "completed"
                     elif decision == "reject" and previous in {"pending", "approved"}:
                         cur.execute("UPDATE cash_requests SET status='rejected',updated_at=NOW() WHERE id=%s AND status IN ('pending','approved')", (cash_request_id,))
                         new_status = "rejected"
@@ -2700,8 +2700,8 @@ def admin_financial_decision(cash_request_id):
                         raise ValueError("invalid_topup_transition")
                 else:
                     if decision == "approve":
-                        approve_withdrawal(cur, cash_request_id)
-                        new_status = "approved"
+                        settle_withdrawal_by_admin(cur, cash_request_id, actor["actor_id"], reason)
+                        new_status = "completed"
                     elif decision == "start_payout":
                         start_withdrawal_payout(cur, cash_request_id)
                         new_status = "payout_in_progress"
@@ -2715,7 +2715,8 @@ def admin_financial_decision(cash_request_id):
                                        decision, reason, body.get("operation_ref"), None,
                                        {"idempotency_key": idem_key})
                 response = {"ok": True, "cash_request_id": cash_request_id, "decision": decision,
-                            "status": new_status, "external_outcome": "not_confirmed"}
+                            "status": new_status,
+                            "external_outcome": "admin_confirmed" if new_status == "completed" else "not_applicable"}
                 _finish_financial_idempotency(cur, operation_type, cash_request_id, idem_key, 200, response)
                 return jsonify(response)
             except ValueError as exc:

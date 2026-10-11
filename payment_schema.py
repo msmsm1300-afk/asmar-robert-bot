@@ -515,6 +515,67 @@ def settle_topup_after_verification(cur, cash_request_id, provider_name,
     return True
 
 
+def settle_topup_by_admin(cur, cash_request_id, actor_id, reason):
+    """Credit a cash top-up atomically after the authorized admin approves it."""
+    cur.execute(
+        """
+        SELECT id,telegram_id,request_type,status,amount_bot
+        FROM cash_requests WHERE id=%s FOR UPDATE
+        """,
+        (cash_request_id,),
+    )
+    request = cur.fetchone()
+    if not request or request["request_type"] != "topup":
+        raise ValueError("topup_request_not_found")
+    if request["status"] == "completed":
+        return False
+    if request["status"] not in {"pending", "approved"}:
+        raise ValueError("topup_not_approvable")
+    cur.execute("SELECT balance FROM users WHERE telegram_id=%s FOR UPDATE", (request["telegram_id"],))
+    user = cur.fetchone()
+    if not user:
+        raise ValueError("user_not_found")
+    before = int(user["balance"] or 0)
+    after = before + int(request["amount_bot"])
+    cur.execute(
+        "UPDATE users SET balance=%s,updated_at=NOW() WHERE telegram_id=%s",
+        (after, request["telegram_id"]),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("topup_balance_update_failed")
+    cur.execute(
+        """
+        UPDATE transactions
+           SET status='completed',balance_before=%s,balance_after=%s,
+               external_outcome='admin_confirmed',settlement_source='admin_approval',
+               details=details || %s
+         WHERE cash_request_id=%s AND tx_type='bot_topup'
+           AND status IN ('pending','unknown_external_result')
+        RETURNING id
+        """,
+        (before, after, Json({"admin_actor_id": str(actor_id), "admin_reason": str(reason)[:1000]}), cash_request_id),
+    )
+    if not cur.fetchone():
+        raise ValueError("topup_transaction_not_pending")
+    cur.execute(
+        """
+        UPDATE cash_requests
+           SET status='completed',external_outcome='admin_confirmed',updated_at=NOW()
+         WHERE id=%s AND status IN ('pending','approved')
+        RETURNING id
+        """,
+        (cash_request_id,),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("topup_admin_settlement_rowcount")
+    record_financial_audit(
+        cur, actor_id, "admin", "admin_settlement", cash_request_id,
+        "topup", request["status"], "completed", "approve", reason,
+        None, None, {"settlement_source": "admin_approval"},
+    )
+    return True
+
+
 def create_method_snapshot(cur, cash_request_id, method_id, direction_id, asset_id, snapshot):
     cur.execute(
         """
@@ -770,4 +831,90 @@ def settle_withdrawal(cur, cash_request_id, external_reference=None):
     cur.execute("UPDATE cash_requests SET status='completed',external_outcome='external_confirmed_success',updated_at=NOW() WHERE id=%s AND status IN ('funds_reserved','approved','payout_in_progress','unknown_external_result') AND external_outcome='external_confirmed_success' RETURNING id", (cash_request_id,))
     if cur.rowcount != 1:
         raise RuntimeError("cash_request_settle_rowcount")
+    return True
+
+
+def settle_withdrawal_by_admin(cur, cash_request_id, actor_id, reason):
+    """Complete a reserved cash withdrawal after authorized admin approval."""
+    cur.execute(
+        """
+        SELECT id,telegram_id,request_type,status,reservation_id
+        FROM cash_requests WHERE id=%s FOR UPDATE
+        """,
+        (cash_request_id,),
+    )
+    request = cur.fetchone()
+    if not request or request["request_type"] != "withdraw":
+        raise ValueError("withdraw_request_not_found")
+    if request["status"] == "completed":
+        return False
+    if request["status"] not in {"funds_reserved", "approved"}:
+        raise ValueError("withdrawal_not_approvable")
+    cur.execute(
+        """
+        SELECT id,telegram_id,amount_bot,status,external_outcome
+        FROM balance_reservations WHERE id=%s AND cash_request_id=%s FOR UPDATE
+        """,
+        (request["reservation_id"], cash_request_id),
+    )
+    reservation = cur.fetchone()
+    if (not reservation or reservation["status"] != "held"
+            or reservation["external_outcome"] != "unknown_external_result"):
+        raise ValueError("withdrawal_reservation_not_held")
+    cur.execute("SELECT balance,reserved_balance FROM users WHERE telegram_id=%s FOR UPDATE", (request["telegram_id"],))
+    user = cur.fetchone()
+    if (not user or int(user["balance"] or 0) < int(reservation["amount_bot"])
+            or int(user["reserved_balance"] or 0) < int(reservation["amount_bot"])):
+        raise RuntimeError("withdrawal_balance_inconsistent")
+    cur.execute(
+        """
+        UPDATE users
+           SET balance=balance-%s,reserved_balance=reserved_balance-%s,updated_at=NOW()
+         WHERE telegram_id=%s
+        """,
+        (reservation["amount_bot"], reservation["amount_bot"], request["telegram_id"]),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("withdrawal_balance_update_failed")
+    cur.execute(
+        """
+        UPDATE balance_reservations
+           SET status='settled',external_outcome='admin_confirmed',
+               external_reference=NULL,updated_at=NOW()
+         WHERE id=%s AND status='held' AND external_outcome='unknown_external_result'
+        RETURNING id
+        """,
+        (reservation["id"],),
+    )
+    if not cur.fetchone():
+        raise RuntimeError("withdrawal_admin_reservation_rowcount")
+    cur.execute(
+        """
+        UPDATE cash_requests
+           SET status='completed',external_outcome='admin_confirmed',updated_at=NOW()
+         WHERE id=%s AND status IN ('funds_reserved','approved')
+        RETURNING id
+        """,
+        (cash_request_id,),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("withdrawal_admin_settlement_rowcount")
+    cur.execute(
+        """
+        UPDATE transactions
+           SET status='completed',external_outcome='admin_confirmed',settlement_source='admin_approval',
+               details=details || %s
+         WHERE cash_request_id=%s AND tx_type='bot_withdraw'
+           AND status IN ('pending','unknown_external_result')
+        RETURNING id
+        """,
+        (Json({"admin_actor_id": str(actor_id), "admin_reason": str(reason)[:1000]}), cash_request_id),
+    )
+    if not cur.fetchone():
+        raise ValueError("withdrawal_transaction_not_pending")
+    record_financial_audit(
+        cur, actor_id, "admin", "admin_settlement", cash_request_id,
+        "withdraw", request["status"], "completed", "approve", reason,
+        None, None, {"settlement_source": "admin_approval"},
+    )
     return True
