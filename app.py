@@ -74,6 +74,7 @@ PUBLIC_BASE_URL = os.environ.get(
 BRIDGE_SHARED_SECRET = os.environ.get("BRIDGE_SHARED_SECRET", "").strip()
 ADMIN_BRIDGE_SHARED_SECRET = os.environ.get("ADMIN_BRIDGE_SHARED_SECRET", "").strip()
 FINANCIAL_ADMIN_SERVICE_ID = os.environ.get("FINANCIAL_ADMIN_SERVICE_ID", "admin_service").strip() or "admin_service"
+BRIDGE_STALE_AFTER_SECONDS = max(90, int(os.environ.get("BRIDGE_STALE_AFTER_SECONDS", "150")))
 PLAYER_EMAIL_DOMAIN = os.environ.get("ICHANCY_PLAYER_EMAIL_DOMAIN", "asmarrobert.example").strip().lower()
 REGISTRATION_MODE = os.environ.get("ICHANCY_REGISTRATION_MODE", "auto").strip().lower()
 if REGISTRATION_MODE not in {"auto", "manual"}:
@@ -93,7 +94,8 @@ _BONUS_CACHE = {"expires": 0.0, "value": {}}
 _SUPPORT_CACHE = {"expires": 0.0, "value": []}
 _ICHANCY_CLIENT = None
 _PAYMENT_STORAGE = None
-
+_BRIDGE_MONITOR_START_LOCK = threading.Lock()
+_BRIDGE_MONITOR_STARTED = False
 flows = {}
 panel_message_ids = {}
 panel_message_kinds = {}
@@ -373,6 +375,14 @@ def ensure_db():
                     last_heartbeat TIMESTAMPTZ,
                     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bridge_alert_state (
+                    device_id TEXT PRIMARY KEY REFERENCES bridge_devices(device_id) ON DELETE CASCADE,
+                    last_alerted_heartbeat TIMESTAMPTZ,
+                    currently_stale BOOLEAN NOT NULL DEFAULT FALSE,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
@@ -1165,6 +1175,82 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return tg("sendMessage", payload)
+
+
+def _bridge_monitor_once():
+    if not db_enabled() or not ADMIN_ID:
+        return
+    ensure_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(824731905)")
+            if not cur.fetchone()["pg_try_advisory_lock"]:
+                return
+            try:
+                cur.execute("""
+                    SELECT d.device_id,d.device_name,d.last_heartbeat,
+                           COALESCE(s.currently_stale,FALSE) AS currently_stale,
+                           s.last_alerted_heartbeat
+                    FROM bridge_devices d
+                    LEFT JOIN bridge_alert_state s ON s.device_id=d.device_id
+                    WHERE d.last_heartbeat IS NOT NULL
+                """)
+                devices = cur.fetchall()
+                for device in devices:
+                    heartbeat = device["last_heartbeat"]
+                    if heartbeat.tzinfo is None:
+                        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+                    is_stale = datetime.now(timezone.utc) - heartbeat > timedelta(seconds=BRIDGE_STALE_AFTER_SECONDS)
+                    was_stale = bool(device["currently_stale"])
+                    if is_stale and (not was_stale or device["last_alerted_heartbeat"] != device["last_heartbeat"]):
+                        result = send_message(
+                            ADMIN_ID,
+                            "⚠️ <b>تنبيه Bridge</b>\n\n"
+                            f"توقف الاتصال مع الجهاز <code>{html.escape(str(device['device_name']))}</code> "
+                            f"منذ أكثر من {BRIDGE_STALE_AFTER_SECONDS} ثانية.\n"
+                            "تحقق من التطبيق والإنترنت، ثم أعد تنشيط Bridge إذا لزم."
+                        )
+                        if result.get("ok"):
+                            cur.execute("""
+                                INSERT INTO bridge_alert_state(device_id,last_alerted_heartbeat,currently_stale,updated_at)
+                                VALUES(%s,%s,TRUE,NOW())
+                                ON CONFLICT(device_id) DO UPDATE SET
+                                    last_alerted_heartbeat=EXCLUDED.last_alerted_heartbeat,
+                                    currently_stale=TRUE,updated_at=NOW()
+                            """, (device["device_id"], device["last_heartbeat"]))
+                    elif not is_stale and was_stale:
+                        result = send_message(
+                            ADMIN_ID,
+                            "✅ <b>عاد Bridge للعمل</b>\n\n"
+                            f"تمت استعادة الاتصال مع الجهاز <code>{html.escape(str(device['device_name']))}</code>."
+                        )
+                        if result.get("ok"):
+                            cur.execute("""
+                                INSERT INTO bridge_alert_state(device_id,currently_stale,updated_at)
+                                VALUES(%s,FALSE,NOW())
+                                ON CONFLICT(device_id) DO UPDATE SET
+                                    currently_stale=FALSE,updated_at=NOW()
+                            """, (device["device_id"],))
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(824731905)")
+
+
+def _bridge_monitor_loop():
+    while True:
+        try:
+            _bridge_monitor_once()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def start_bridge_monitor():
+    global _BRIDGE_MONITOR_STARTED
+    with _BRIDGE_MONITOR_START_LOCK:
+        if _BRIDGE_MONITOR_STARTED:
+            return
+        _BRIDGE_MONITOR_STARTED = True
+        threading.Thread(target=_bridge_monitor_loop, name="bridge-stale-monitor", daemon=True).start()
 
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
@@ -2610,6 +2696,7 @@ def bridge_heartbeat():
     if not db_enabled():
         return bridge_json_error("postgres_required", 503)
     ensure_db()
+    start_bridge_monitor()
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
