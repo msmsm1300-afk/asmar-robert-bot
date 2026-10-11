@@ -592,6 +592,29 @@ def start_withdrawal_payout(cur, cash_request_id):
     return transition_withdrawal(cur, cash_request_id, "payout_in_progress")
 
 
+def start_ichancy_withdrawal_payout(cur, cash_request_id):
+    """Start a reserved iChancy payout without cash-admin approval."""
+    row = _lock_withdrawal(cur, cash_request_id)
+    if row["request_status"] not in {"funds_reserved", "approved"}:
+        raise ValueError("invalid_ichancy_withdrawal_previous_state")
+    if row["reservation_status"] != "held" or row["external_outcome"] != "unknown_external_result":
+        raise ValueError("withdrawal_reservation_not_held")
+    cur.execute(
+        """
+        UPDATE cash_requests
+           SET status='payout_in_progress',updated_at=NOW()
+         WHERE id=%s AND request_type='withdraw'
+           AND status IN ('funds_reserved','approved')
+           AND method='ichancy' AND reservation_id=%s
+         RETURNING id
+        """,
+        (cash_request_id, row["reservation_id"]),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("ichancy_withdrawal_transition_rowcount")
+    return True
+
+
 def record_external_outcome(cur, cash_request_id, outcome, external_reference=None):
     """Bind a confirmed/unknown external outcome before any local settlement."""
     allowed = {

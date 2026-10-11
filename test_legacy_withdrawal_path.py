@@ -211,7 +211,7 @@ class LegacyWithdrawalPathTests(unittest.TestCase):
                 cur.execute("SELECT balance,reserved_balance FROM users WHERE telegram_id=%s", (LOCAL_CHAT_ID,))
                 self.assertEqual(dict(cur.fetchone()), {"balance": 30000, "reserved_balance": 0})
 
-    def test_claim_before_admin_approval_is_rejected_without_claiming_job(self):
+    def test_ichancy_withdrawal_claims_without_admin_approval(self):
         queued = app.enqueue_ichancy_withdraw(LOCAL_CHAT_ID, 20000, "claim-before-approval")
         self.assertTrue(queued["ok"])
         self._heartbeat()
@@ -221,14 +221,14 @@ class LegacyWithdrawalPathTests(unittest.TestCase):
             headers=self._auth_headers(),
             json={"device_id": "legacy-test-device", "job_types": ["withdraw"]},
         )
-        self.assertEqual(response.status_code, 409, response.get_json())
-        self.assertEqual(response.get_json()["error"], "withdrawal_admin_approval_required")
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["job"]["job_id"], queued["job_id"])
         with app.db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT status FROM bridge_jobs WHERE job_id=%s", (queued["job_id"],))
-                self.assertEqual(cur.fetchone()["status"], "pending")
+                self.assertEqual(cur.fetchone()["status"], "running")
                 cur.execute("SELECT status FROM cash_requests WHERE details->>'job_id'=%s", (queued["job_id"],))
-                self.assertEqual(cur.fetchone()["status"], "funds_reserved")
+                self.assertEqual(cur.fetchone()["status"], "payout_in_progress")
                 cur.execute("SELECT balance,reserved_balance FROM users WHERE telegram_id=%s", (LOCAL_CHAT_ID,))
                 self.assertEqual(dict(cur.fetchone()), {"balance": 50000, "reserved_balance": 20000})
 

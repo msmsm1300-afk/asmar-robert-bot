@@ -43,6 +43,7 @@ from payment_schema import (
     reserve_withdrawal,
     approve_withdrawal,
     start_withdrawal_payout,
+    start_ichancy_withdrawal_payout,
     record_external_outcome,
     settle_withdrawal,
     release_withdrawal,
@@ -3004,13 +3005,40 @@ def bridge_next_job():
                 SET status='pending', claimed_by=NULL, error=NULL, updated_at=NOW()
                 WHERE job_id IN (SELECT job_id FROM newest_failed_registration)
             """)
+            # The Bridge normally asks for all job types. An unapproved
+            # withdrawal must not block unrelated deposits/reads, but an
+            # explicit withdrawal-only request keeps the approval guard below.
+            allow_other_job_types = not requested_types or any(
+                job_type != "withdraw" for job_type in requested_types
+            )
+            withdraw_ready_clause = "" if not allow_other_job_types else """
+                      AND (
+                          j.job_type <> 'withdraw'
+                          OR EXISTS (
+                              SELECT 1
+                              FROM cash_requests cr
+                              JOIN balance_reservations br
+                                ON br.id=cr.reservation_id
+                               AND br.cash_request_id=cr.id
+                              WHERE cr.id=(j.payload->>'cash_request_id')::bigint
+                                AND cr.request_type='withdraw'
+                                AND (
+                                    (cr.method='ichancy' AND cr.status='funds_reserved')
+                                    OR cr.status='approved'
+                                )
+                                AND br.status='held'
+                                AND br.external_outcome='unknown_external_result'
+                          )
+                      )
+            """
             if requested_types:
                 cur.execute("""
                     SELECT job_id::text AS job_id, request_id, job_type, payload, attempts,
                            execution_attempt_id::text AS execution_attempt_id
-                    FROM bridge_jobs
-                    WHERE status='pending' AND job_type = ANY(%s)
+                    FROM bridge_jobs j
+                    WHERE j.status='pending' AND j.job_type = ANY(%s)
                       AND NOT (job_type='withdraw' AND NOT (payload ? 'cash_request_id'))
+                """ + withdraw_ready_clause + """
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -3019,9 +3047,10 @@ def bridge_next_job():
                 cur.execute("""
                     SELECT job_id::text AS job_id, request_id, job_type, payload, attempts,
                            execution_attempt_id::text AS execution_attempt_id
-                    FROM bridge_jobs
-                    WHERE status='pending'
+                    FROM bridge_jobs j
+                    WHERE j.status='pending'
                       AND NOT (job_type='withdraw' AND NOT (payload ? 'cash_request_id'))
+                """ + withdraw_ready_clause + """
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -3045,6 +3074,7 @@ def bridge_next_job():
                     cash_request_id = int((row.get("payload") or {}).get("cash_request_id") or 0)
                     cur.execute("""
                         SELECT cr.status AS request_status,
+                               cr.method AS request_method,
                                cr.reservation_id,
                                br.status AS reservation_status,
                                br.external_outcome
@@ -3057,8 +3087,12 @@ def bridge_next_job():
                     withdrawal = cur.fetchone()
                     if not withdrawal:
                         return bridge_json_error("withdraw_request_not_found", 409)
-                    if withdrawal["request_status"] != "approved":
+                    if (withdrawal["request_method"] != "ichancy"
+                            and withdrawal["request_status"] != "approved"):
                         return bridge_json_error("withdrawal_admin_approval_required", 409)
+                    if (withdrawal["request_method"] == "ichancy"
+                            and withdrawal["request_status"] not in {"funds_reserved", "approved"}):
+                        return bridge_json_error("withdrawal_not_ready", 409)
                     if (not withdrawal["reservation_id"]
                             or withdrawal["reservation_status"] != "held"
                             or withdrawal["external_outcome"] != "unknown_external_result"):
@@ -3091,7 +3125,10 @@ def bridge_next_job():
                     return jsonify({"ok": True, "job": None})
                 row["execution_attempt_id"] = claimed["execution_attempt_id"]
                 if row["job_type"] == "withdraw":
-                    start_withdrawal_payout(cur, cash_request_id)
+                    if withdrawal["request_method"] == "ichancy":
+                        start_ichancy_withdrawal_payout(cur, cash_request_id)
+                    else:
+                        start_withdrawal_payout(cur, cash_request_id)
             else:
                 cur.execute("""
                     UPDATE bridge_jobs
