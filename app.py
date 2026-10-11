@@ -1090,9 +1090,9 @@ def _customer_job_outcome_message(job_type, status, provider_error=""):
                 or "amount is greater than you have" in provider_error
         ):
             return (
-                "⚠️ <b>رفض iChancy عملية الشحن</b>\n\n"
-                "رصيد المصدر المتاح لدى الوكيل غير كافٍ لهذا المبلغ. "
-                "لم يُخصم أي مبلغ من رصيدك في البوت. جرّب مبلغًا أصغر أو تواصل مع الإدارة لتعبئة رصيد المصدر."
+                "⚠️ <b>تعذّر تنفيذ عملية الشحن حاليًا</b>\n\n"
+                "الخدمة بحاجة إلى إعادة تعبئة مؤقتة. لم يُخصم أي مبلغ من رصيدك. "
+                "يرجى المحاولة لاحقًا."
             )
         if status == "failed" and "min deposit" in provider_error:
             return (
